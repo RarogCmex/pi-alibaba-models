@@ -248,6 +248,82 @@ export function parseSidecarResponse(body: unknown): SidecarParsed {
   return parsed;
 }
 
+/**
+ * DashScope often wraps a rate limit as an SSE `error` event with HTTP 200:
+ * `server_error: <429> InternalError.Algo: ... [Too many requests.]`
+ * rather than an outer HTTP 429. Modern pi retries messages whose
+ * `errorMessage` matches `429` / `too many requests`; prefixing `429 `
+ * makes that classifier fire even when the status is buried in `server_error`.
+ */
+const RATE_LIMIT_TEXT = /too many requests|throttling(?:\.(?:ratequota|burstrate|allocationquota|rate))?|limit_requests|limit_burst_rate|rate.?limit/i;
+const EMBEDDED_429 = /<429\b|HTTP_STATUS\/429|(?:^|[\s:])429(?:\s|:|\b)/;
+const ALGO_INVALID_PARAM = /InternalError\.Algo\.InvalidParameter/i;
+
+export function isDashScopeRateLimitError(text: string): boolean {
+  if (!text || ALGO_INVALID_PARAM.test(text)) return false;
+  if (EMBEDDED_429.test(text) && (RATE_LIMIT_TEXT.test(text) || /InternalError\.Algo\b/i.test(text))) return true;
+  if (/Throttling\.(RateQuota|BurstRate|AllocationQuota)|limit_requests|limit_burst_rate/i.test(text)) return true;
+  return /InternalError\.Algo\b/i.test(text) && /too many requests/i.test(text);
+}
+
+export function rewriteDashScopeRateLimitErrorMessage(errorMessage: string): string | undefined {
+  if (!isDashScopeRateLimitError(errorMessage)) return undefined;
+  if (/^\s*429\b/.test(errorMessage)) return undefined;
+  return `429 ${errorMessage}`;
+}
+
+export class DashScopeStreamError extends Error {
+  readonly status: number;
+  constructor(message: string, status = 429) {
+    super(message);
+    this.name = "DashScopeStreamError";
+    this.status = status;
+  }
+}
+
+function eventErrorText(ev: Record<string, unknown>): string {
+  const err = asRecord(ev.error) ?? asRecord(asRecord(ev.response)?.error);
+  const parts = [
+    typeof ev.type === "string" ? ev.type : "",
+    typeof ev.code === "string" ? ev.code : "",
+    typeof ev.message === "string" ? ev.message : "",
+    typeof err?.type === "string" ? err.type : "",
+    typeof err?.code === "string" ? err.code : "",
+    typeof err?.message === "string" ? err.message : "",
+    typeof ev.error === "string" ? ev.error : "",
+  ];
+  return parts.filter(Boolean).join(" ");
+}
+
+/** Turn a Responses/Completions/Anthropic SSE JSON object into a stream error, if any. */
+export function sidecarStreamError(event: unknown): { status: number; message: string } | undefined {
+  const ev = asRecord(event);
+  if (!ev) return undefined;
+
+  const httpStatus =
+    (typeof ev._httpStatus === "number" && ev._httpStatus) ||
+    (typeof ev.status === "number" && ev.status) ||
+    undefined;
+  const type = typeof ev.type === "string" ? ev.type : "";
+  const errObj = asRecord(ev.error) ?? asRecord(asRecord(ev.response)?.error);
+  const blob = eventErrorText(ev);
+  const isErrorEvent =
+    type === "error" ||
+    type === "response.failed" ||
+    type === "response.error" ||
+    Boolean(errObj) ||
+    httpStatus != null && httpStatus >= 400;
+
+  if (!isErrorEvent) return undefined;
+
+  const status = isDashScopeRateLimitError(blob) || httpStatus === 429 ? 429
+    : httpStatus && httpStatus >= 400 ? httpStatus
+    : 500;
+  const message = blob || `DashScope stream error (${status})`;
+  const prefixed = status === 429 ? (rewriteDashScopeRateLimitErrorMessage(message) ?? message) : message;
+  return { status, message: prefixed };
+}
+
 /** Fold one Responses/Completions SSE JSON object into accumulated sidecar state. */
 export function applySidecarStreamEvent(parsed: SidecarParsed, event: unknown): void {
   const ev = asRecord(event);
@@ -288,10 +364,34 @@ export function consumeSseChunk(buffer: string, onEvent: (data: unknown) => void
   const parts = buffer.split(/\r?\n\r?\n/);
   const rest = parts.pop() ?? "";
   for (const block of parts) {
-    const dataLines = block.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart());
+    const lines = block.split(/\r?\n/);
+    let httpStatus: number | undefined;
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      const status = line.match(/^:?HTTP_STATUS\/(\d{3})\b/);
+      if (status) {
+        httpStatus = Number(status[1]);
+        continue;
+      }
+      if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    }
     const payload = dataLines.join("\n");
-    if (!payload || payload === "[DONE]") continue;
-    try { onEvent(JSON.parse(payload)); } catch { /* ignore keepalives / malformed */ }
+    if (!payload || payload === "[DONE]") {
+      if (httpStatus === 429) {
+        onEvent({ type: "error", _httpStatus: 429, error: { type: "rate_limit_error", message: "Too many requests" } });
+      }
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (httpStatus != null && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      (parsed as Record<string, unknown>)._httpStatus = httpStatus;
+    }
+    onEvent(parsed);
   }
   return rest;
 }
@@ -331,6 +431,111 @@ export function formatSidecarResult(parsed: SidecarParsed, heading?: string): st
 export function formatSidecarProgress(action: SidecarAction, elapsedMs: number, parsed: SidecarParsed): string {
   const secs = Math.max(1, Math.round(elapsedMs / 1000));
   return formatSidecarResult(parsed, `DashScope sidecar (${action}) running… ${secs}s`);
+}
+
+/** Same budget as pi's default `settings.retry` (3 attempts, 2s/4s/8s). */
+export const SIDECAR_RETRY_MAX = 3;
+export const SIDECAR_RETRY_BASE_DELAY_MS = 2_000;
+
+export function sidecarRetryDelayMs(attempt: number, baseDelayMs = SIDECAR_RETRY_BASE_DELAY_MS): number {
+  return baseDelayMs * 2 ** (attempt - 1);
+}
+
+export function formatSidecarRetry(
+  action: SidecarAction,
+  attempt: number,
+  maxAttempts: number,
+  delayMs: number,
+): string {
+  const wait = delayMs >= 1000 ? `${Math.round(delayMs / 1000)}s` : `${delayMs}ms`;
+  return `DashScope sidecar (${action}) 429, retrying ${attempt}/${maxAttempts} in ${wait}…`;
+}
+
+export function isSidecarRateLimitResult(res: { ok: boolean; status: number; json: unknown }): boolean {
+  if (res.ok) return false;
+  if (res.status === 429) return true;
+  return isDashScopeRateLimitError(dashScopeErrorMessage(res.status, res.json));
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      reject(err);
+      return;
+    }
+    if (ms <= 0) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export type SidecarRetryInfo = {
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  errorMessage: string;
+};
+
+export async function runSidecarWithRetry(
+  domain: string,
+  apiKey: string,
+  req: { url: string; body: Record<string, unknown>; timeoutMs: number; action: SidecarAction },
+  signal?: AbortSignal,
+  onProgress?: SidecarProgressFn,
+  retry?: {
+    maxRetries?: number;
+    baseDelayMs?: number;
+    onRetry?: (info: SidecarRetryInfo) => void;
+  },
+): Promise<{ ok: boolean; status: number; json: unknown; parsed: SidecarParsed; retries: number }> {
+  const maxRetries = retry?.maxRetries ?? SIDECAR_RETRY_MAX;
+  const baseDelayMs = retry?.baseDelayMs ?? SIDECAR_RETRY_BASE_DELAY_MS;
+  const deadline = Date.now() + req.timeoutMs;
+  let retries = 0;
+  let last = await postSidecar(
+    domain,
+    apiKey,
+    { ...req, timeoutMs: Math.max(1, deadline - Date.now()) },
+    signal,
+    onProgress,
+  );
+  while (isSidecarRateLimitResult(last) && retries < maxRetries) {
+    retries++;
+    const delayMs = sidecarRetryDelayMs(retries, baseDelayMs);
+    retry?.onRetry?.({
+      attempt: retries,
+      maxAttempts: maxRetries,
+      delayMs,
+      errorMessage: dashScopeErrorMessage(last.status, last.json),
+    });
+    try {
+      await sleep(delayMs, signal);
+    } catch (e: any) {
+      if (e?.name === "AbortError") throw new Error(sidecarTimeoutMessage(req.action, req.timeoutMs, true));
+      throw e;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    last = await postSidecar(
+      domain,
+      apiKey,
+      { ...req, timeoutMs: remaining },
+      signal,
+      onProgress,
+    );
+  }
+  return { ...last, retries };
 }
 
 export function sidecarTimeoutMessage(action: SidecarAction, timeoutMs: number, userAbort: boolean): string {
@@ -412,13 +617,16 @@ export async function postSidecar(
       const text = await res.text();
       let json: unknown;
       try { json = JSON.parse(text); } catch { json = { raw: text }; }
-      return { ok: false, status: res.status, json, parsed };
+      const streamErr = sidecarStreamError(json);
+      return { ok: false, status: streamErr?.status === 429 ? 429 : res.status, json, parsed };
     }
 
     if (!res.body || (!ctype.includes("event-stream") && ctype.includes("json"))) {
       const text = await res.text();
       let json: unknown;
       try { json = JSON.parse(text); } catch { json = { raw: text }; }
+      const streamErr = sidecarStreamError(json);
+      if (streamErr) return { ok: false, status: streamErr.status, json, parsed };
       const done = parseSidecarResponse(json);
       return { ok: true, status: res.status, json, parsed: done };
     }
@@ -428,6 +636,8 @@ export async function postSidecar(
     let buf = "";
     let lastEmit = 0;
     const absorb = (event: unknown) => {
+      const streamErr = sidecarStreamError(event);
+      if (streamErr) throw new DashScopeStreamError(streamErr.message, streamErr.status);
       applySidecarStreamEvent(parsed, event);
       const now = Date.now();
       if (now - lastEmit > 400) {
@@ -449,6 +659,9 @@ export async function postSidecar(
     };
     return { ok: true, status: res.status, json, parsed };
   } catch (e: any) {
+    if (e?.name === "DashScopeStreamError") {
+      return { ok: false, status: typeof e.status === "number" ? e.status : 429, json: { error: { message: e.message } }, parsed };
+    }
     if (e?.name === "AbortError") {
       throw new Error(sidecarTimeoutMessage(req.action, req.timeoutMs, !timedOut));
     }

@@ -7,8 +7,10 @@ import {
   dashScopeErrorMessage,
   formatSidecarProgress,
   formatSidecarResult,
+  formatSidecarRetry,
   pickSidecarModel,
-  postSidecar,
+  rewriteDashScopeRateLimitErrorMessage,
+  runSidecarWithRetry,
   type SidecarAction,
   type SidecarStrategy,
 } from "./sidecar.ts";
@@ -1057,6 +1059,19 @@ export default async function (pi: ExtensionAPI) {
   migrateLegacyAuth();
   const config = loadConfig();
 
+  // DashScope Anthropic-compat returns rate limits as SSE `server_error`
+  // with `<429>` in the message (HTTP 200), not as HTTP 429. Prefix the
+  // assistant error so modern pi's retry classifier matches it.
+  pi.on("message_end", (event) => {
+    const { message } = event;
+    if (message.role !== "assistant") return;
+    if (message.stopReason !== "error") return;
+    if (message.provider !== "alibaba-plan" && message.provider !== "alibaba-cloud") return;
+    const rewritten = rewriteDashScopeRateLimitErrorMessage(message.errorMessage ?? "");
+    if (!rewritten) return;
+    return { message: { ...message, errorMessage: rewritten } };
+  });
+
   let planKey: string | null = null;
   try {
     const auth = readAuth();
@@ -1686,11 +1701,18 @@ export default async function (pi: ExtensionAPI) {
           content: [{ type: "text", text: formatSidecarProgress(action, 0, { text: "", sources: [], calls: [] }) }],
           details: { action, model: picked.id, transport: picked.transport, partial: true },
         });
-        const res = await postSidecar(domain, key, req, signal, (parsed, elapsedMs) => {
+        const res = await runSidecarWithRetry(domain, key, req, signal, (parsed, elapsedMs) => {
           onUpdate?.({
             content: [{ type: "text", text: formatSidecarProgress(action, elapsedMs, parsed) }],
             details: { action, model: picked.id, transport: picked.transport, partial: true, calls: parsed.calls },
           });
+        }, {
+          onRetry: ({ attempt, maxAttempts, delayMs }) => {
+            onUpdate?.({
+              content: [{ type: "text", text: formatSidecarRetry(action, attempt, maxAttempts, delayMs) }],
+              details: { action, model: picked.id, transport: picked.transport, partial: true, retry: attempt, maxAttempts },
+            });
+          },
         });
         if (!res.ok) throw new Error(dashScopeErrorMessage(res.status, res.json));
         return {
@@ -1701,6 +1723,7 @@ export default async function (pi: ExtensionAPI) {
             transport: picked.transport,
             calls: res.parsed.calls,
             sourceCount: res.parsed.sources.length,
+            retries: res.retries,
           },
         };
       },

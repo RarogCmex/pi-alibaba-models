@@ -8,11 +8,16 @@ import {
   dashScopeErrorMessage,
   formatSidecarProgress,
   formatSidecarResult,
+  formatSidecarRetry,
+  isDashScopeRateLimitError,
   parseSidecarResponse,
   pickSidecarModel,
   pickSidecarTransport,
   postSidecar,
   responsesToolsAllowed,
+  rewriteDashScopeRateLimitErrorMessage,
+  runSidecarWithRetry,
+  sidecarStreamError,
   sidecarTimeoutMessage,
   sidecarTimeoutMs,
   sidecarToolsFor,
@@ -184,6 +189,49 @@ describe("request + parse", () => {
   });
 });
 
+describe("DashScope 429 stream events", () => {
+  const WRAPPED_429 =
+    "server_error: <429> InternalError.Algo: An error occurred in model serving, error message is: [Too many requests.]";
+
+  it("classifies the Anthropic-wrapped InternalError.Algo 429 variant", () => {
+    assert.equal(isDashScopeRateLimitError(WRAPPED_429), true);
+    assert.equal(isDashScopeRateLimitError(`Error: ${WRAPPED_429}`), true);
+    assert.equal(
+      rewriteDashScopeRateLimitErrorMessage(WRAPPED_429),
+      `429 ${WRAPPED_429}`,
+    );
+    assert.equal(rewriteDashScopeRateLimitErrorMessage(`429 ${WRAPPED_429}`), undefined);
+    assert.equal(
+      isDashScopeRateLimitError("InternalError.Algo.InvalidParameter: Range of max_tokens should be [1, 32768]"),
+      false,
+    );
+  });
+
+  it("lifts the wrapped 429 out of an Anthropic/Responses error event", () => {
+    const err = sidecarStreamError({
+      type: "error",
+      error: {
+        type: "server_error",
+        message: "<429> InternalError.Algo: An error occurred in model serving, error message is: [Too many requests.]",
+      },
+    });
+    assert.equal(err?.status, 429);
+    assert.match(err?.message ?? "", /^429 /);
+    assert.match(err?.message ?? "", /Too many requests/);
+  });
+
+  it("reads :HTTP_STATUS/429 comments from SSE frames", () => {
+    const events: unknown[] = [];
+    consumeSseChunk(
+      ':HTTP_STATUS/429\nevent: error\ndata: {"code":"Throttling.RateQuota","message":"Too many requests"}\n\n',
+      (ev) => events.push(ev),
+    );
+    assert.equal(events.length, 1);
+    const err = sidecarStreamError(events[0]);
+    assert.equal(err?.status, 429);
+  });
+});
+
 describe("postSidecar abort", () => {
   it("fails immediately when the input signal is already aborted", async () => {
     const originalFetch = globalThis.fetch;
@@ -211,6 +259,125 @@ describe("postSidecar abort", () => {
           "sk-test",
           { url: "/responses", body: {}, timeoutMs: 200, action: "search" },
           ac.signal,
+        ),
+        /DashScope sidecar aborted/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("postSidecar stream 429", () => {
+  it("fails the sidecar when DashScope wraps a 429 as a server_error SSE event", async () => {
+    const originalFetch = globalThis.fetch;
+    const body =
+      'event: error\ndata: {"type":"error","error":{"type":"server_error","message":"<429> InternalError.Algo: An error occurred in model serving, error message is: [Too many requests.]"}}\n\n';
+    globalThis.fetch = (async () => new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })) as typeof fetch;
+    try {
+      const res = await postSidecar(
+        "dashscope-intl.aliyuncs.com",
+        "sk-test",
+        { url: "/responses", body: {}, timeoutMs: 2000, action: "search" },
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.status, 429);
+      assert.match(dashScopeErrorMessage(res.status, res.json), /429.*Too many requests/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("runSidecarWithRetry", () => {
+  const SSE_429 =
+    'event: error\ndata: {"type":"error","error":{"type":"server_error","message":"<429> InternalError.Algo: An error occurred in model serving, error message is: [Too many requests.]"}}\n\n';
+  const SSE_OK =
+    'data: {"type":"response.output_text.delta","delta":"Hangzhou is sunny."}\n\n';
+
+  it("shows a user-facing retry line and hides a recovered 429 from the result", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(calls === 1 ? SSE_429 : SSE_OK, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+    const retries: string[] = [];
+    try {
+      const res = await runSidecarWithRetry(
+        "dashscope-intl.aliyuncs.com",
+        "sk-test",
+        { url: "/responses", body: {}, timeoutMs: 2000, action: "search" },
+        undefined,
+        undefined,
+        {
+          maxRetries: 3,
+          baseDelayMs: 0,
+          onRetry: (info) => retries.push(formatSidecarRetry("search", info.attempt, info.maxAttempts, info.delayMs)),
+        },
+      );
+      assert.equal(res.ok, true);
+      assert.equal(res.retries, 1);
+      assert.equal(calls, 2);
+      assert.equal(res.parsed.text, "Hangzhou is sunny.");
+      assert.equal(retries.length, 1);
+      assert.match(retries[0] ?? "", /429, retrying 1\/3/);
+      assert.doesNotMatch(formatSidecarResult(res.parsed), /429/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("returns the last 429 after the retry budget is exhausted", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(SSE_429, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+    try {
+      const res = await runSidecarWithRetry(
+        "dashscope-intl.aliyuncs.com",
+        "sk-test",
+        { url: "/responses", body: {}, timeoutMs: 2000, action: "search" },
+        undefined,
+        undefined,
+        { maxRetries: 2, baseDelayMs: 0 },
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.status, 429);
+      assert.equal(res.retries, 2);
+      assert.equal(calls, 3);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("aborts during the retry wait", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(SSE_429, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })) as typeof fetch;
+    const ac = new AbortController();
+    try {
+      await assert.rejects(
+        () => runSidecarWithRetry(
+          "dashscope-intl.aliyuncs.com",
+          "sk-test",
+          { url: "/responses", body: {}, timeoutMs: 2000, action: "search" },
+          ac.signal,
+          undefined,
+          { maxRetries: 1, baseDelayMs: 5_000, onRetry: () => ac.abort() },
         ),
         /DashScope sidecar aborted/,
       );

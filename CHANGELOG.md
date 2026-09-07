@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.2
+
+- **DashScope 429-as-`server_error`:** rate limits that arrive as an SSE error event (`server_error: <429> InternalError.Algo: ... [Too many requests.]`) are treated as HTTP 429. On the main chat path, `message_end` prefixes the assistant `errorMessage` with `429` so modern pi auto-retries with backoff (the model never sees the failed turn). `alibaba_tools` copies that retry loop internally: the tool card shows `429, retrying n/3…`, and a recovered call returns only the sidecar result to the model.
+
 ## 1.4.1
 
 - **Honor relocated pi config directories:** paths are now resolved through pi's `getAgentDir()` instead of hardcoding `~/.pi/agent`. Under a `PI_CODING_AGENT_DIR` override (e.g. Nix/Guix setups) the extension previously missed `/login` credentials entirely, wrote config/caches to the wrong place, and `/alibaba → Reset all` scrubbed a phantom `settings.json` while leaving the real one pointing at a removed provider.
