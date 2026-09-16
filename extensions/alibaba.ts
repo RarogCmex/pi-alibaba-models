@@ -9,6 +9,7 @@ import {
   formatSidecarResult,
   formatSidecarRetry,
   pickSidecarModel,
+  rewriteDashScopeBackendOverflowMessage,
   rewriteDashScopeRateLimitErrorMessage,
   runSidecarWithRetry,
   type SidecarAction,
@@ -1059,15 +1060,20 @@ export default async function (pi: ExtensionAPI) {
   migrateLegacyAuth();
   const config = loadConfig();
 
-  // DashScope Anthropic-compat returns rate limits as SSE `server_error`
-  // with `<429>` in the message (HTTP 200), not as HTTP 429. Prefix the
-  // assistant error so modern pi's retry classifier matches it.
+  // DashScope reports some transient failures as SSE `server_error` events
+  // over HTTP 200: rate limits with `<429>` in the message, and inference-
+  // backend `Backend buffer overflow` errors. Prefix the assistant error so
+  // modern pi's retry classifier matches it — a bare `Backend buffer
+  // overflow.` carries no retryable marker and would fail the turn at once.
   pi.on("message_end", (event) => {
     const { message } = event;
     if (message.role !== "assistant") return;
     if (message.stopReason !== "error") return;
     if (message.provider !== "alibaba-plan" && message.provider !== "alibaba-cloud") return;
-    const rewritten = rewriteDashScopeRateLimitErrorMessage(message.errorMessage ?? "");
+    const errorMessage = message.errorMessage ?? "";
+    const rewritten =
+      rewriteDashScopeRateLimitErrorMessage(errorMessage) ??
+      rewriteDashScopeBackendOverflowMessage(errorMessage);
     if (!rewritten) return;
     return { message: { ...message, errorMessage: rewritten } };
   });
@@ -1707,9 +1713,9 @@ export default async function (pi: ExtensionAPI) {
             details: { action, model: picked.id, transport: picked.transport, partial: true, calls: parsed.calls },
           });
         }, {
-          onRetry: ({ attempt, maxAttempts, delayMs }) => {
+          onRetry: ({ attempt, maxAttempts, delayMs, reason }) => {
             onUpdate?.({
-              content: [{ type: "text", text: formatSidecarRetry(action, attempt, maxAttempts, delayMs) }],
+              content: [{ type: "text", text: formatSidecarRetry(action, attempt, maxAttempts, delayMs, reason) }],
               details: { action, model: picked.id, transport: picked.transport, partial: true, retry: attempt, maxAttempts },
             });
           },

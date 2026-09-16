@@ -9,12 +9,14 @@ import {
   formatSidecarProgress,
   formatSidecarResult,
   formatSidecarRetry,
+  isDashScopeBackendOverflowError,
   isDashScopeRateLimitError,
   parseSidecarResponse,
   pickSidecarModel,
   pickSidecarTransport,
   postSidecar,
   responsesToolsAllowed,
+  rewriteDashScopeBackendOverflowMessage,
   rewriteDashScopeRateLimitErrorMessage,
   runSidecarWithRetry,
   sidecarStreamError,
@@ -229,6 +231,98 @@ describe("DashScope 429 stream events", () => {
     assert.equal(events.length, 1);
     const err = sidecarStreamError(events[0]);
     assert.equal(err?.status, 429);
+  });
+});
+
+describe("DashScope backend buffer overflow", () => {
+  const OVERFLOW = "Backend buffer overflow.";
+  const SSE_OVERFLOW =
+    'event: error\ndata: {"type":"error","error":{"type":"server_error","message":"Backend buffer overflow."}}\n\n';
+  const SSE_OK =
+    'data: {"type":"response.output_text.delta","delta":"Hangzhou is sunny."}\n\n';
+
+  it("prefixes the bare message so pi's retry classifier matches", () => {
+    assert.equal(isDashScopeBackendOverflowError(OVERFLOW), true);
+    assert.equal(isDashScopeBackendOverflowError(`Error: ${OVERFLOW}`), true);
+    assert.equal(isDashScopeBackendOverflowError("Range of max_tokens should be [1, 32768]"), false);
+    assert.equal(rewriteDashScopeBackendOverflowMessage(OVERFLOW), `server_error ${OVERFLOW}`);
+    // Already carries a retryable marker — no double prefix, no 429 rewrite.
+    assert.equal(rewriteDashScopeBackendOverflowMessage(`server_error: ${OVERFLOW}`), undefined);
+    assert.equal(rewriteDashScopeRateLimitErrorMessage(OVERFLOW), undefined);
+  });
+
+  it("surfaces as a 500 from an Anthropic/Responses error event", () => {
+    const err = sidecarStreamError({
+      type: "error",
+      error: { type: "server_error", message: "Backend buffer overflow." },
+    });
+    assert.equal(err?.status, 500);
+    assert.match(err?.message ?? "", /server_error/);
+    assert.match(err?.message ?? "", /Backend buffer overflow/);
+  });
+
+  it("retries the sidecar once and hides a recovered overflow from the result", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(calls === 1 ? SSE_OVERFLOW : SSE_OK, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+    const retries: string[] = [];
+    try {
+      const res = await runSidecarWithRetry(
+        "dashscope-intl.aliyuncs.com",
+        "sk-test",
+        { url: "/responses", body: {}, timeoutMs: 2000, action: "search" },
+        undefined,
+        undefined,
+        {
+          maxRetries: 3,
+          baseDelayMs: 0,
+          onRetry: (info) => retries.push(formatSidecarRetry("search", info.attempt, info.maxAttempts, info.delayMs, info.reason)),
+        },
+      );
+      assert.equal(res.ok, true);
+      assert.equal(res.retries, 1);
+      assert.equal(calls, 2);
+      assert.equal(res.parsed.text, "Hangzhou is sunny.");
+      assert.equal(retries.length, 1);
+      assert.match(retries[0] ?? "", /server_error, retrying 1\/3/);
+      assert.doesNotMatch(formatSidecarResult(res.parsed), /buffer overflow/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("returns the last overflow after the retry budget is exhausted", async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(SSE_OVERFLOW, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+    try {
+      const res = await runSidecarWithRetry(
+        "dashscope-intl.aliyuncs.com",
+        "sk-test",
+        { url: "/responses", body: {}, timeoutMs: 2000, action: "search" },
+        undefined,
+        undefined,
+        { maxRetries: 2, baseDelayMs: 0 },
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.status, 500);
+      assert.equal(res.retries, 2);
+      assert.equal(calls, 3);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

@@ -272,6 +272,29 @@ export function rewriteDashScopeRateLimitErrorMessage(errorMessage: string): str
   return `429 ${errorMessage}`;
 }
 
+/**
+ * `Backend buffer overflow.` is a transient DashScope inference-backend
+ * failure delivered like the wrapped 429 above: an SSE `server_error` event,
+ * usually over HTTP 200. Modern pi's retry classifier fires on it only when a
+ * retryable marker (`server_error`, `500`, …) survives into the assistant
+ * `errorMessage` — an SDK path that strips the code and surfaces the bare
+ * message would fail the turn on the spot, so prefix `server_error ` then.
+ */
+const BACKEND_BUFFER_OVERFLOW = /backend\s*buffer\s*overflow/i;
+// Retryable markers in pi's isRetryableAssistantError — if one is already
+// present in the message, no prefix is needed (also avoids double-prefixing).
+const RETRYABLE_MARKER = /server.?error|internal.?error|overloaded|service.?unavailable|too many requests|rate.?limit|429|5(?:00|02|03|04|24)/i;
+
+export function isDashScopeBackendOverflowError(text: string): boolean {
+  return BACKEND_BUFFER_OVERFLOW.test(text);
+}
+
+export function rewriteDashScopeBackendOverflowMessage(errorMessage: string): string | undefined {
+  if (!isDashScopeBackendOverflowError(errorMessage)) return undefined;
+  if (RETRYABLE_MARKER.test(errorMessage)) return undefined;
+  return `server_error ${errorMessage}`;
+}
+
 export class DashScopeStreamError extends Error {
   readonly status: number;
   constructor(message: string, status = 429) {
@@ -446,15 +469,22 @@ export function formatSidecarRetry(
   attempt: number,
   maxAttempts: number,
   delayMs: number,
+  reason = "429",
 ): string {
   const wait = delayMs >= 1000 ? `${Math.round(delayMs / 1000)}s` : `${delayMs}ms`;
-  return `DashScope sidecar (${action}) 429, retrying ${attempt}/${maxAttempts} in ${wait}…`;
+  return `DashScope sidecar (${action}) ${reason}, retrying ${attempt}/${maxAttempts} in ${wait}…`;
 }
 
 export function isSidecarRateLimitResult(res: { ok: boolean; status: number; json: unknown }): boolean {
   if (res.ok) return false;
   if (res.status === 429) return true;
   return isDashScopeRateLimitError(dashScopeErrorMessage(res.status, res.json));
+}
+
+/** Transient inference-backend failure, retried on the same budget as 429s. */
+export function isSidecarBackendOverflowResult(res: { ok: boolean; status: number; json: unknown }): boolean {
+  if (res.ok) return false;
+  return isDashScopeBackendOverflowError(dashScopeErrorMessage(res.status, res.json));
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -485,6 +515,8 @@ export type SidecarRetryInfo = {
   maxAttempts: number;
   delayMs: number;
   errorMessage: string;
+  /** Short label for the retry notice: "429" or "server_error". */
+  reason: string;
 };
 
 export async function runSidecarWithRetry(
@@ -510,7 +542,7 @@ export async function runSidecarWithRetry(
     signal,
     onProgress,
   );
-  while (isSidecarRateLimitResult(last) && retries < maxRetries) {
+  while ((isSidecarRateLimitResult(last) || isSidecarBackendOverflowResult(last)) && retries < maxRetries) {
     retries++;
     const delayMs = sidecarRetryDelayMs(retries, baseDelayMs);
     retry?.onRetry?.({
@@ -518,6 +550,7 @@ export async function runSidecarWithRetry(
       maxAttempts: maxRetries,
       delayMs,
       errorMessage: dashScopeErrorMessage(last.status, last.json),
+      reason: isSidecarRateLimitResult(last) ? "429" : "server_error",
     });
     try {
       await sleep(delayMs, signal);

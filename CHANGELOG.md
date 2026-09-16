@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.3
+
+- **DashScope `Backend buffer overflow` handling:** this transient inference-backend failure arrives like the wrapped 429 — an SSE `server_error` event, usually over HTTP 200. Chat path: `message_end` prefixes a bare `Backend buffer overflow.` error with `server_error` so pi's retry classifier matches it (paths that keep the `server_error:` code were already retried). `alibaba_tools` retries it inside the tool on the same budget as 429s; the retry notice shows `server_error, retrying n/3…`.
+
 ## 1.4.2
 
 - **DashScope 429-as-`server_error`:** rate limits that arrive as an SSE error event (`server_error: <429> InternalError.Algo: ... [Too many requests.]`) are treated as HTTP 429. On the main chat path, `message_end` prefixes the assistant `errorMessage` with `429` so modern pi auto-retries with backoff (the model never sees the failed turn). `alibaba_tools` copies that retry loop internally: the tool card shows `429, retrying n/3…`, and a recovered call returns only the sidecar result to the model.
