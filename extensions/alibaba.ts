@@ -29,18 +29,39 @@ const CLOUD_CACHE_PATH = path.join(HOME_DIR, "alibaba-cloud-models.cache.json");
 
 const MODELS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 
-// Reasoning models: hide "off" (same as before) and opt in to high/max.
-// Intermediate pi levels are explicitly unsupported — do not alias them
-// onto "high" the way DeepSeek's native map does.
-const REASONING_THINKING_LEVEL_MAP = {
-  off: null,
-  minimal: null,
-  low: null,
-  medium: null,
+// ── Thinking levels (measured against the live endpoint) ─────────────
+//
+// pi reads `thinkingLevelMap` as a tristate: a string is sent to the provider,
+// `null` hides the level, and an omitted key falls back to pi's default
+// (extended xhigh/max stay unsupported when omitted). Duplicate strings are
+// fine — pi clamps upward first, so `medium: "high"` makes picking Medium
+// send `high` rather than reject.
+//
+// Everything below was probed against the workspace endpoint on 2026-09-22:
+//   • the Anthropic path splits `maxTokens` into a thinking budget plus the
+//     answer, so each model's own catalog ceiling is used (never an
+//     id-based guess — the endpoint rejects anything larger).
+//   • the OpenAI paths send `reasoning_effort` (some models also require
+//     `enable_thinking`), and each family accepts a different subset.
+
+// Anthropic path. DashScope rejects `thinking_budget` for Kimi alone
+// (`Parameter thinking_budget is not supported`) — `--thinking off` still sends
+// the field, so kimi must not be flagged as reasoning at all (see
+// Fornace/pi-alibaba-models#9).
+//
+// `off` must be a *string*, not `null`: pi clamps an unsupported level upward,
+// so `off: null` would silently turn "off" into a real thinking budget instead
+// of sending `thinking: {type: "disabled"}`. The mapped value itself is unused
+// on this path — pi only checks that it is not null.
+const ANTHROPIC_ALL_LEVELS: Record<string, string | null> = {
+  off: "off",
+  minimal: "minimal",
+  low: "low",
+  medium: "medium",
   high: "high",
-  xhigh: null,
+  xhigh: "xhigh",
   max: "max",
-} as const;
+};
 
 const DEFAULT_PLAN_OPENAI = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_PLAN_ANTHROPIC = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
@@ -151,12 +172,17 @@ interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[];
 export const isVisionModel = (id: string): boolean =>
   /vl|vision/i.test(id) || /^qwen3\.\d+-plus\b/i.test(id) || /^qwen3\.8\b/i.test(id) || /kimi/i.test(id);
 
-// Kimi on DashScope Anthropic-compat rejects thinking_budget
-// (`Parameter thinking_budget is not supported`), and `--thinking off`
-// still sends the field. Do not flag kimi as reasoning — pi then omits it.
-// See Fornace/pi-alibaba-models#9.
+// Whether a model accepts thinking controls at all. This deliberately follows
+// the naming heuristics below rather than the catalog's `Reasoning` tag: the
+// /api/v1/models tag is unreliable in both directions (it marks `qwen-turbo`
+// as reasoning even though the id accepts no thinking controls, and lists
+// plain `qwen3-30b-a3b` without the tag although it answers with reasoning).
+// The Anthropic path is lenient — every family except Kimi accepts
+// `thinking_budget` — so a miss here only costs the thinking picker.
 export const isReasoningModel = (id: string): boolean =>
-  !/^kimi/i.test(id) && /qwq|max|thinking|deepseek|minimax|glm|3\.[5-9]/i.test(id);
+  !/^kimi/i.test(id) &&
+  /qwq|max|thinking|deepseek|minimax|glm|stepfun|unisound|^qwen3-\d|^qwen-(plus|flash)(-|$)|3\.[5-9]/i.test(id) &&
+  !/^qwen-(plus|flash)-character/i.test(id);
 
 // Infer context window (tokens) from model id. Sources:
 // https://www.alibabacloud.com/help/en/model-studio/models
@@ -182,32 +208,28 @@ const inferContextWindow = (id: string, overrides?: Record<string, number>): num
   return 131072;
 };
 
-// Infer max output tokens (the maxTokens card value) from model id.
+// Infer the maxTokens card value from the model id.
 //
-// pi's Anthropic path splits maxTokens into a thinking budget and a final
-// answer budget (maxTokens − thinkingBudget). The card used to be a flat
-// 8192 for every Cloud model; with pi's high thinking budget (16384) the
-// answer budget collapsed to 8192 − 7168 = 1024 tokens, so large tool calls
-// (big write/edit content, JSON-escaped) were truncated mid-arguments — the
-// model never got to emit the `path` field and the content string was cut.
-//
-// Verified empirically against the Anthropic-compat endpoint: 32768 is the
-// universal max_tokens ceiling (non-reasoning qwen-plus rejects 65536 with
-// `Range of max_tokens should be [1, 32768]`, while qwen3.8-max,
-// deepseek-v4-flash, glm-5.2 and kimi-k2.7-code all accept 32768). So every
-// reasoning model gets 32768 → answer budget = 32768 − 16384 = 16384 at
-// high thinking, and 32768 can never be rejected as out of range. Non-
-// reasoning models keep the conservative 8192 (pi sends it straight as the
-// output cap; there is no thinking squeeze to fix).
-export const inferAnthropicMaxTokens = (id: string): number => {
-  if (isReasoningModel(id)) return 32768;
-  return 8192;
+// pi's Anthropic path splits maxTokens into a thinking budget plus the answer
+// (maxTokens − thinkingBudget). The safe value is the catalog's own
+// `max_output_tokens`, which is per-model and already known to the endpoint
+// (qwen-plus = 32768, qwen3-coder-plus = 65536, qwen3-30b-a3b = 8192,
+// qwen3.8-max = 131072). Sending a larger number is rejected with
+// `Range of max_tokens should be [1, N]`, so the catalog value is never
+// exceeded. Models with no catalog row fall back to the conservative pair.
+export const ANTHROPIC_MAX_TOKENS = 131072;
+export const inferAnthropicMaxTokens = (id: string, catalogMax?: number): number => {
+  if (typeof catalogMax === "number" && Number.isFinite(catalogMax) && catalogMax > 0) {
+    return Math.min(catalogMax, ANTHROPIC_MAX_TOKENS);
+  }
+  return isReasoningModel(id) ? 32768 : 8192;
 };
 
 // Catalog / OpenAI-path ceilings. Used for Chat Completions and Responses —
 // those APIs do not share max_tokens between thinking and the answer the way
 // Anthropic-compat does. Do not use these on the Anthropic path.
 export const inferOpenAIMaxTokens = (id: string): number => {
+  if (/^kimi-k?3/i.test(id)) return 1048576;
   if (/^deepseek-?v4/i.test(id)) return 384000;
   if (/^qwen3\.\d+-max\b/i.test(id)) return 131072;
   if (/^glm-?5\.2\b/i.test(id)) return 131072;
@@ -220,17 +242,68 @@ export const inferOpenAIMaxTokens = (id: string): number => {
   return 16384;
 };
 
-const QWEN38_EFFORT_MAP: Record<string, string | null> = {
-  off: null, minimal: null, low: "low", medium: "medium", high: null, xhigh: "xhigh", max: null,
+// Chat Completions (`reasoning_effort`) maps. Measured 2026-09-22 with a
+// *per-model* `max_completion_tokens` — probing with a budget above a model's
+// own ceiling returns `Range of max_tokens…` and looks like a rejected effort.
+//
+//   qwen3.8                    none minimal low medium high xhigh max
+//   qwen3.7/3.6/3.5            none minimal low medium high xhigh
+//   qwen3-max / -coder / next  none minimal low medium high xhigh max
+//   qwen-plus/flash/turbo      none minimal low medium high xhigh max
+//   qwen3.8-2.4t / 3.7-preview            minimal low medium high xhigh max
+//   glm-5.3                               low             high      max
+//   glm-5.2 / glm-4.x          none minimal low medium high xhigh max
+//   glm-5.1 / glm-5            none minimal low medium high xhigh
+//   deepseek-v4-pro/flash                 low medium high xhigh max
+//   deepseek-v4.1-flash/0813/0731 none minimal low medium high xhigh max
+//   kimi-k3                    none minimal low medium high xhigh max
+//   kimi-k2.5/2.6/2.7          none minimal low medium high xhigh
+//   MiniMax-M2.5                          low medium high xhigh
+//   MiniMax-M2.1               none minimal low medium high xhigh max
+//
+// `off: null` means the family rejects `enable_thinking: false`; pi then omits
+// both fields and DashScope runs the model's own default (thinking on).
+const COMPLETIONS_UNIVERSAL: Record<string, string | null> = {
+  off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
 };
-const GLM_DEEPSEEK_EFFORT_MAP: Record<string, string | null> = {
+const COMPLETIONS_NO_MAX: Record<string, string | null> = {
+  off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null,
+};
+const COMPLETIONS_ALWAYS_ON: Record<string, string | null> = {
+  off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+};
+const COMPLETIONS_GLM_DEEPSEEK: Record<string, string | null> = {
   off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max",
 };
-// Responses API: reasoning.effort. Docs list none/minimal/low/medium/high plus
-// xhigh/max (Beijing/Singapore). Map pi's "off" onto "none" so thinking can
-// actually be disabled. https://help.aliyun.com/zh/model-studio/compatibility-with-openai-responses-api
+// GLM-5.3 and MiniMax-M2.5 only accept a narrow set; the levels they reject
+// are first clamped by pi, then sent as the documented value.
+const COMPLETIONS_GLM53: Record<string, string | null> = {
+  off: null, minimal: null, low: "low", medium: "high", high: "high", xhigh: null, max: "max",
+};
+const COMPLETIONS_MINIMAX25: Record<string, string | null> = {
+  off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null,
+};
+const COMPLETIONS_MINIMAX21: Record<string, string | null> = {
+  off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+};
+
+// Responses path (`reasoning.effort`). A clean `off` is expressible as "none"
+// on the models that accept it; the rest fall back to the Completions table.
+// https://help.aliyun.com/zh/model-studio/compatibility-with-openai-responses-api
 const RESPONSES_EFFORT_MAP: Record<string, string | null> = {
   off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+};
+// No literal "none" — thinking cannot be switched off on these ids.
+const RESPONSES_NO_OFF_MAX: Record<string, string | null> = {
+  off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+};
+// Only up to `medium` is accepted.
+const RESPONSES_MEDIUM_CEILING: Record<string, string | null> = {
+  off: "none", minimal: "minimal", low: "low", medium: "medium", high: null, xhigh: null, max: null,
+};
+// Only the literal "none" is accepted.
+const RESPONSES_NONE_ONLY: Record<string, string | null> = {
+  off: "none", minimal: null, low: null, medium: null, high: null, xhigh: null, max: null,
 };
 
 const OPENAI_BASE_COMPAT = {
@@ -239,7 +312,7 @@ const OPENAI_BASE_COMPAT = {
   supportsStore: false,
 };
 
-export function thinkingConfigFor(id: string, api: string): {
+export interface ThinkingConfig {
   thinkingLevelMap: Record<string, string | null>;
   compat: {
     thinkingFormat: "qwen";
@@ -247,25 +320,85 @@ export function thinkingConfigFor(id: string, api: string): {
     supportsDeveloperRole?: boolean;
     supportsStore?: boolean;
   };
-} | undefined {
+}
+
+export function thinkingConfigFor(id: string, api: string): ThinkingConfig | undefined {
   if (!isReasoningModel(id)) return undefined;
-  if (api === "openai-completions") {
-    if (/^qwen3\.8\b/i.test(id)) {
-      return { thinkingLevelMap: QWEN38_EFFORT_MAP, compat: { ...OPENAI_BASE_COMPAT, supportsReasoningEffort: true } };
-    }
-    if (/^deepseek-?v4/i.test(id) || /^glm-?5\.\d/i.test(id)) {
-      return { thinkingLevelMap: GLM_DEEPSEEK_EFFORT_MAP, compat: { ...OPENAI_BASE_COMPAT, supportsReasoningEffort: true } };
-    }
-    return { thinkingLevelMap: { ...REASONING_THINKING_LEVEL_MAP }, compat: { ...OPENAI_BASE_COMPAT } };
-  }
-  if (api === "openai-responses") {
-    return { thinkingLevelMap: { ...RESPONSES_EFFORT_MAP }, compat: { ...OPENAI_BASE_COMPAT } };
-  }
-  return { thinkingLevelMap: { ...REASONING_THINKING_LEVEL_MAP }, compat: { thinkingFormat: "qwen" } };
+  if (api === "openai-completions") return completionsThinkingConfig(id);
+  if (api === "openai-responses") return responsesThinkingConfig(id);
+  // Anthropic-compatible: pi derives the thinking budget from the level, so
+  // every level is selectable and `off` maps to `thinking: {type: "disabled"}`.
+  return {
+    thinkingLevelMap: { ...ANTHROPIC_ALL_LEVELS },
+    compat: { thinkingFormat: "qwen" },
+  };
+}
+
+function completionsThinkingConfig(id: string): ThinkingConfig {
+  const send = (map: Record<string, string | null>): ThinkingConfig => ({
+    thinkingLevelMap: { ...map },
+    compat: { ...OPENAI_BASE_COMPAT, supportsReasoningEffort: true },
+  });
+  if (/^qwen3\.8-2\.4t/i.test(id)) return send(COMPLETIONS_ALWAYS_ON);
+  if (/^qwen3\.7-max-(preview|2026-05-17)/i.test(id)) return send(COMPLETIONS_ALWAYS_ON);
+  if (/^qwen3\.8/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
+  if (/^qwen3\.[5-7]/i.test(id)) return send(COMPLETIONS_NO_MAX);
+  if (/^qwen3-max|^qwen3-(coder|next)/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
+  if (/^qwen3-\d/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
+  if (/^glm-?5\.3/i.test(id)) return send(COMPLETIONS_GLM53);
+  // GLM-4.5/4.5-Air reject `reasoning_effort` outright, so compat must not
+  // advertise support; the level strings are then never sent and the server
+  // runs thinking at its own default.
+  if (/^glm-?4\.5/i.test(id)) return { thinkingLevelMap: { ...COMPLETIONS_UNIVERSAL }, compat: { ...OPENAI_BASE_COMPAT } };
+  if (/^glm/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
+  if (/^deepseek-?v4/i.test(id)) return send(COMPLETIONS_GLM_DEEPSEEK);
+  if (/^minimax-?m2\.5/i.test(id)) return send(COMPLETIONS_MINIMAX25);
+  if (/^minimax-?m2\.1/i.test(id)) return send(COMPLETIONS_MINIMAX21);
+  if (/^kimi-k3/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
+  if (/^kimi/i.test(id)) return send(COMPLETIONS_NO_MAX);
+  return send(COMPLETIONS_UNIVERSAL);
+}
+
+function responsesThinkingConfig(id: string): ThinkingConfig {
+  const base = (map: Record<string, string | null>): ThinkingConfig => ({
+    thinkingLevelMap: { ...map },
+    compat: { ...OPENAI_BASE_COMPAT },
+  });
+  // Measured acceptance per family (table above). `reasoning.effort` replaces
+  // the Completions `enable_thinking` toggle, so `off` becomes the literal
+  // effort "none" wherever the model accepts it.
+  if (/^qwen3\.8-2\.4t/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
+  if (/^qwen3\.7-max-(preview|2026-05-17)/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
+  if (/^qwen3\.8/i.test(id)) return base(RESPONSES_EFFORT_MAP);
+  if (/^qwen3\.7-(max|plus)/i.test(id)) return base(RESPONSES_EFFORT_MAP);
+  if (/^glm-?5\.3/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
+  if (/^glm-?4\.5/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
+  if (/^deepseek-?v4/i.test(id)) return base(RESPONSES_EFFORT_MAP);
+  if (/^minimax-?m2\.1$/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
+  if (/^qwen3\.([5-7])/i.test(id)) return base(RESPONSES_MEDIUM_CEILING);
+  if (/^qwen-(plus|flash|turbo)(-|$)/i.test(id)) return base(RESPONSES_NONE_ONLY);
+  return base(RESPONSES_EFFORT_MAP);
+}
+
+// Cloud models the Responses endpoint cannot serve (measured 2026-09-22).
+// When the user picks the Responses Cloud format, models outside this set stay
+// on Chat Completions instead of being exposed and then 400ing on send.
+// Families are matched by id so brand-new snapshots inherit the behaviour.
+export function supportsCloudResponses(id: string): boolean {
+  if (/^qwen3\.\d/i.test(id)) return true;
+  if (/^qwen3-/i.test(id)) return true;
+  if (/^qwen-(plus|flash|turbo)(-|$)/i.test(id)) return true;
+  if (/^deepseek-?v4/i.test(id)) return true;
+  if (/^deepseek-?v3\.1/i.test(id)) return true;
+  if (/^kimi-k3/i.test(id)) return true;
+  if (/^glm-?(4\.6|5\.[23])/i.test(id)) return true;
+  if (/^minimax-?m2\.1$/i.test(id)) return true;
+  return false;
 }
 
 export function resolveCloudApi(id: string, fmt: CloudApiFormat): CloudApiFormat {
   if (fmt === "anthropic-messages" && /deepseek/i.test(id)) return "openai-completions";
+  if (fmt === "openai-responses" && !supportsCloudResponses(id)) return "openai-completions";
   return fmt;
 }
 
@@ -354,7 +487,8 @@ export function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthrop
     const tc = thinkingConfigFor(m.id, api);
     return {
       id: m.id, name: m.name, reasoning: m.reasoning, input: m.input,
-      contextWindow: m.contextWindow, maxTokens: m.maxTokens,
+      contextWindow: m.contextWindow,
+      maxTokens: useOpenAI ? m.maxTokens : inferAnthropicMaxTokens(m.id),
       compat: useOpenAI
         ? { ...(m.compat ?? {}), ...(tc?.compat ?? {}), supportsDeveloperRole: false, supportsStore: false }
         : (tc?.compat ?? m.compat),
@@ -629,10 +763,18 @@ export function buildCloudModels(models: ProviderModelConfig[], domain: string, 
     const openai = api !== "anthropic-messages";
     return {
       ...m,
-      maxTokens: api === "anthropic-messages" ? inferAnthropicMaxTokens(m.id) : (m.maxTokens || inferOpenAIMaxTokens(m.id)),
+      maxTokens: api === "anthropic-messages" ? inferAnthropicMaxTokens(m.id, m.maxTokens) : (m.maxTokens || inferOpenAIMaxTokens(m.id)),
       thinkingLevelMap: tc?.thinkingLevelMap,
       compat: openai
-        ? { ...(m.compat ?? {}), ...(tc?.compat ?? {}), supportsDeveloperRole: false, supportsStore: false }
+        ? {
+            ...(m.compat ?? {}),
+            ...(tc?.compat ?? {}),
+            // compatible-mode rejects the `developer` role
+            // (`developer is not one of ['system', ...]`) and has no `store`
+            // field, so both stay off on every Cloud model.
+            supportsDeveloperRole: false,
+            supportsStore: false,
+          }
         : (tc?.compat ?? m.compat),
       baseUrl: openai ? `https://${domain}/compatible-mode/v1` : `https://${domain}/apps/anthropic`,
       api,

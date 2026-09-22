@@ -9,6 +9,9 @@ import {
   isReasoningModel,
   isVisionModel,
   parseApiV1Prices,
+  resolveCloudApi,
+  supportsCloudResponses,
+  thinkingConfigFor,
 } from "../extensions/alibaba.ts";
 
 const reasoningQwen = {
@@ -24,19 +27,19 @@ const reasoningQwen = {
 
 const nonReasoning = {
   ...reasoningQwen,
-  id: "qwen-plus",
-  name: "Qwen Plus",
+  id: "qwen-turbo",
+  name: "Qwen Turbo",
   reasoning: false,
   compat: undefined,
 };
 
 const EXPECTED_REASONING_MAP = {
-  off: null,
-  minimal: null,
-  low: null,
-  medium: null,
+  off: "off",
+  minimal: "minimal",
+  low: "low",
+  medium: "medium",
   high: "high",
-  xhigh: null,
+  xhigh: "xhigh",
   max: "max",
 };
 
@@ -50,7 +53,9 @@ function compatFlags(model: { compat?: object }) {
 }
 
 describe("thinkingLevelMap", () => {
-  it("opts reasoning models into high and max without aliasing unused levels", () => {
+  it("exposes every level on the Anthropic path, with a string `off`", () => {
+    // `off` must not be null: pi clamps an unsupported level *upward*, so a
+    // null `off` silently upgraded "thinking off" into a real thinking budget.
     const [plan] = buildPlanModels(
       [{ ...reasoningQwen, openaiOnly: false }],
       "https://plan.example/openai",
@@ -60,6 +65,7 @@ describe("thinkingLevelMap", () => {
 
     assert.deepEqual(plan.thinkingLevelMap, EXPECTED_REASONING_MAP);
     assert.deepEqual(cloud.thinkingLevelMap, EXPECTED_REASONING_MAP);
+    assert.equal(plan.thinkingLevelMap?.off, "off");
   });
 
   it("leaves non-reasoning models without a thinking map", () => {
@@ -91,8 +97,19 @@ describe("isReasoningModel", () => {
     assert.equal(isReasoningModel("minimax-m2.5"), true);
   });
 
-  it("does not flag plain qwen-plus", () => {
-    assert.equal(isReasoningModel("qwen-plus"), false);
+  it("flags Qwen plus/flash and the open-weight qwen3-<size>b line", () => {
+    assert.equal(isReasoningModel("qwen-plus"), true);
+    assert.equal(isReasoningModel("qwen-flash"), true);
+    assert.equal(isReasoningModel("qwen3-30b-a3b"), true);
+  });
+
+  it("does not flag qwen-turbo, which accepts no thinking controls", () => {
+    assert.equal(isReasoningModel("qwen-turbo"), false);
+  });
+
+  it("does not flag the -character roleplay variants", () => {
+    assert.equal(isReasoningModel("qwen-plus-character"), false);
+    assert.equal(isReasoningModel("qwen-flash-character"), false);
   });
 });
 
@@ -152,14 +169,74 @@ describe("openai-responses", () => {
     assert.equal(anthropicFmt.api, "openai-completions");
     assert.equal(responsesFmt.api, "openai-responses");
   });
+
+  it("falls back to Chat Completions for models the Responses endpoint rejects", () => {
+    // Measured against the live endpoint: these ids answer `Agent
+    // capabilities are not enabled` on /responses even though they work on
+    // /chat/completions, so exposing them on Responses would only 400.
+    assert.equal(supportsCloudResponses("kimi-k2.6"), false);
+    assert.equal(supportsCloudResponses("glm-5.1"), false);
+    assert.equal(supportsCloudResponses("MiniMax-M2.5"), false);
+    assert.equal(supportsCloudResponses("qwen-max"), false);
+
+    assert.equal(resolveCloudApi("kimi-k2.6", "openai-responses"), "openai-completions");
+    assert.equal(resolveCloudApi("qwen3.8-max", "openai-responses"), "openai-responses");
+    assert.equal(resolveCloudApi("kimi-k3", "openai-responses"), "openai-responses");
+    // The Anthropic format still only re-routes DeepSeek.
+    assert.equal(resolveCloudApi("kimi-k2.6", "anthropic-messages"), "anthropic-messages");
+  });
+});
+
+describe("thinkingConfigFor", () => {
+  it("keeps `off` sendable on the Anthropic path", () => {
+    // pi clamps an unsupported level *upward*, so `off: null` would silently
+    // turn "thinking off" into a real budget instead of sending
+    // `thinking: {type: "disabled"}`.
+    const cfg = thinkingConfigFor("qwen3.8-max", "anthropic-messages");
+    assert.equal(cfg?.thinkingLevelMap.off, "off");
+    assert.equal(cfg?.compat.thinkingFormat, "qwen");
+    assert.equal(cfg?.compat.supportsReasoningEffort, undefined);
+  });
+
+  it("hides the levels Chat Completions cannot express per family", () => {
+    const glm53 = thinkingConfigFor("glm-5.3", "openai-completions");
+    assert.deepEqual(glm53?.thinkingLevelMap, {
+      off: null, minimal: null, low: "low", medium: "high", high: "high", xhigh: null, max: "max",
+    });
+    // Everything above `medium` is rejected on qwen3.6-plus.
+    const qwen36 = thinkingConfigFor("qwen3.6-plus", "openai-completions");
+    assert.equal(qwen36?.thinkingLevelMap.max, null);
+    assert.equal(qwen36?.thinkingLevelMap.high, "high");
+  });
+
+  it("does not advertise reasoning_effort for GLM-4.5", () => {
+    // GLM-4.5 rejects `reasoning_effort` outright, so pi must not send it.
+    const cfg = thinkingConfigFor("glm-4.5", "openai-completions");
+    assert.equal(cfg?.compat.supportsReasoningEffort, undefined);
+  });
+
+  it("returns undefined for non-reasoning ids", () => {
+    assert.equal(thinkingConfigFor("qwen-turbo", "anthropic-messages"), undefined);
+    assert.equal(thinkingConfigFor("qwen-turbo", "openai-completions"), undefined);
+  });
 });
 
 describe("maxTokens vs API shape", () => {
-  it("clamps Anthropic reasoning models to the verified 32768 ceiling", () => {
-    const fat = { ...reasoningQwen, maxTokens: 131_072 };
-    const [cloud] = buildCloudModels([fat], "dashscope.example", "anthropic-messages");
-    assert.equal(inferAnthropicMaxTokens("qwen3.7-max"), 32_768);
+  it("uses the per-model catalog ceiling on the Anthropic path", () => {
+    // The endpoint rejects `max_tokens` above the model's own limit
+    // (`Range of max_tokens should be [1, N]`), and the catalog reports N per
+    // model, so that value is authoritative — never an id-based guess.
+    const plus = { ...reasoningQwen, id: "qwen-plus", maxTokens: 32_768 };
+    const coder = { ...reasoningQwen, id: "qwen3-coder-plus", maxTokens: 65_536 };
+    const [cloud] = buildCloudModels([plus], "dashscope.example", "anthropic-messages");
+    const [cloudCoder] = buildCloudModels([coder], "dashscope.example", "anthropic-messages");
     assert.equal(cloud.maxTokens, 32_768);
+    assert.equal(cloudCoder.maxTokens, 65_536);
+  });
+
+  it("falls back to a conservative ceiling when the catalog has no row", () => {
+    assert.equal(inferAnthropicMaxTokens("qwen3.7-max"), 32_768);
+    assert.equal(inferAnthropicMaxTokens("qwen-turbo"), 8_192);
   });
 
   it("keeps catalog maxTokens on OpenAI Completions and Responses", () => {

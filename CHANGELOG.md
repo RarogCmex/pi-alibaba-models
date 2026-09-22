@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.4
+
+- **Correct per-model `max_tokens` on the Anthropic path.** The extension used to send a flat id-based guess (32768 for reasoning models, 8192 otherwise). DashScope enforces a *per-model* ceiling and rejects anything larger with `Range of max_tokens should be [1, N]`, so prompts failed outright on models below the guess — `qwen-plus`, `qwen-turbo` (16384), `qwen3-30b-a3b` (8192). The catalog's own `max_output_tokens` is now authoritative, clamped at 131072; models with no catalog row keep the conservative fallback.
+- **Thinking can be switched off on the Anthropic path again.** `thinkingLevelMap.off` was `null`, and pi *clamps an unsupported level upward* — so `--thinking off` silently became `low` and always paid for thinking. `off` now maps to a real value that serializes as `thinking: {type: "disabled"}`.
+- **Per-family thinking levels on both OpenAI paths.** Each family accepts a different `reasoning_effort` subset and some require `enable_thinking` alongside it; the previous maps offered levels the endpoint rejects (e.g. `max` on Qwen 3.5–3.7, `none`/`minimal` on GLM-5.3, `max` on MiniMax-M2.5) and hid ones it accepts. The maps are now per-family and were verified against the live endpoint. GLM-4.5 no longer advertises `supportsReasoningEffort` (it rejects the field outright).
+- **Stop advertising Responses for models that cannot serve it.** With the Cloud format set to OpenAI Responses, models such as `kimi-k2.6`, `glm-5.1`, `MiniMax-M2.5` and `qwen-max` answered `Agent capabilities are not enabled` on every request. They now stay on Chat Completions automatically; the Responses-capable set is measured per family.
+- **Reasoning detection matches the real catalogs.** `qwen-plus`/`qwen-flash` and the open-weight `qwen3-<size>b` line are reasoning; `qwen-turbo` and the `-character` variants are not.
+
 ## 1.4.3
 
 - **DashScope `Backend buffer overflow` handling:** this transient inference-backend failure arrives like the wrapped 429 — an SSE `server_error` event, usually over HTTP 200. Chat path: `message_end` prefixes a bare `Backend buffer overflow.` error with `server_error` so pi's retry classifier matches it (paths that keep the `server_error:` code were already retried). `alibaba_tools` retries it inside the tool on the same budget as 429s; the retry notice shows `server_error, retrying n/3…`.
