@@ -1139,6 +1139,9 @@ type RefreshCtx = {
   force?: boolean;
   signal?: AbortSignal;
   stored?: { models?: readonly ProviderModelConfig[] };
+  // `any`: pi's ModelsPublication is not re-exported as a public type, and the
+  // publication object is built here anyway (persist + checkedAt).
+  publish?(publication: any): Promise<boolean>;
 };
 
 // Coordination for many pi instances sharing one agent dir: alibaba-config.json
@@ -1151,35 +1154,75 @@ const CATALOG_FRESH_MS = 10 * 60 * 1000;
 export const catalogFresh = (fetchedAt?: number, now = Date.now()): boolean =>
   typeof fetchedAt === "number" && Number.isFinite(fetchedAt) && now - fetchedAt < CATALOG_FRESH_MS;
 
-// Best-effort fetch: a failure keeps whatever we already hold and warns.
-async function loadPlanCatalog(force: boolean): Promise<PlanModelDef[]> {
+// Cross-instance fetch lock: models-store.json is one shared file and pi has
+// no inter-process locking, so parallel fetchers would race on publishing it.
+// One fetcher at a time (`wx` makes creation atomic); the others skip and are
+// served pi's stored snapshot. A lock older than 60s belongs to a crashed
+// fetcher and is stolen. The GET is idempotent, so the rare double-fetch on a
+// boundary race is harmless.
+const CATALOG_LOCK_PATH = path.join(HOME_DIR, "alibaba-catalog.lock");
+const CATALOG_LOCK_STALE_MS = 60_000;
+
+async function acquireCatalogLock(waitMs = 0): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      fs.writeFileSync(CATALOG_LOCK_PATH, String(process.pid), { flag: "wx", mode: 0o600 });
+      return true;
+    } catch {
+      try {
+        if (Date.now() - fs.statSync(CATALOG_LOCK_PATH).mtimeMs > CATALOG_LOCK_STALE_MS) {
+          fs.unlinkSync(CATALOG_LOCK_PATH);
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+}
+const releaseCatalogLock = () => { try { fs.unlinkSync(CATALOG_LOCK_PATH); } catch {} };
+
+type CatalogResult<T> = { defs: T[]; fetched: boolean }; 
+
+// Best-effort fetch under the cross-instance lock: a failure keeps whatever we
+// already hold and warns. `fetched` tells the caller whether this run really
+// pulled a catalog (and may publish it to pi's store).
+async function loadPlanCatalog(force: boolean): Promise<CatalogResult<PlanModelDef>> {
   const cfg = loadConfig();
-  if (!force && catalogFresh(cfg.planFetchedAt)) return planDefs;
+  if (!force && catalogFresh(cfg.planFetchedAt)) return { defs: planDefs, fetched: false };
+  if (!(await acquireCatalogLock(force ? 10_000 : 0))) return { defs: planDefs, fetched: false };
   try {
     const defs = await fetchPlanModels(force, readAuth()["alibaba-plan"]);
     planDefs = defs;
     cfg.planFetchedAt = Date.now();
     saveConfig(cfg);
-    return defs;
+    return { defs, fetched: true };
   } catch (e: any) {
     console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); keeping ${planDefs.length} previously loaded models.`);
-    return planDefs;
+    return { defs: planDefs, fetched: false };
+  } finally {
+    releaseCatalogLock();
   }
 }
 
-async function loadCloudCatalog(domain: string, apiKey: string, force: boolean): Promise<ProviderModelConfig[]> {
+async function loadCloudCatalog(domain: string, apiKey: string, force: boolean): Promise<CatalogResult<ProviderModelConfig>> {
   const cfg = loadConfig();
-  if (!force && catalogFresh(cfg.cloudFetchedAt)) return cloudDefs;
+  if (!force && catalogFresh(cfg.cloudFetchedAt)) return { defs: cloudDefs, fetched: false };
+  if (!(await acquireCatalogLock(force ? 10_000 : 0))) return { defs: cloudDefs, fetched: false };
   try {
     const { models, authorizedOnly } = await fetchCloudModels(domain, apiKey, force);
-    cloudDefs = models.length ? models : CLOUD_LOGIN_SEED;
+    const defs = models.length ? models : CLOUD_LOGIN_SEED;
+    cloudDefs = defs;
     cfg.cloudFetchedAt = Date.now();
     cfg.cloudAuthorizedFilteredLast = authorizedOnly;
     saveConfig(cfg);
-    return cloudDefs;
+    return { defs, fetched: models.length > 0 };
   } catch (e: any) {
     console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); keeping ${cloudDefs.length} previously loaded models.`);
-    return cloudDefs;
+    return { defs: cloudDefs, fetched: false };
+  } finally {
+    releaseCatalogLock();
   }
 }
 
@@ -1191,10 +1234,20 @@ const planRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConf
   const creds = readAuth()["alibaba-plan"];
   if (!creds?.access) return [];
   const ep = resolvePlanEndpoints(creds);
-  const defs = context.allowNetwork
-    ? await loadPlanCatalog(!!context.force)
-    : (planDefs.length ? planDefs : ((context.stored?.models ?? []) as unknown as PlanModelDef[]));
-  return buildPlanModels(defs, ep.openai, ep.anthropic, loadConfig().contextWindowOverrides);
+  const overrides = loadConfig().contextWindowOverrides;
+  if (!context.allowNetwork) {
+    // Cache-only phase: re-derive pi's stored snapshot — never a store write.
+    if (!planDefs.length) planDefs = ((context.stored?.models ?? []) as unknown as PlanModelDef[]);
+    return buildPlanModels(planDefs, ep.openai, ep.anthropic, overrides);
+  }
+  const result = await loadPlanCatalog(!!context.force);
+  const built = buildPlanModels(result.defs, ep.openai, ep.anthropic, overrides);
+  // Exactly one models-store.json write per real fetch — pi's legacy
+  // ProviderConfig does not persist refreshModels returns by itself.
+  if (result.fetched && result.defs.length) {
+    await context.publish?.({ persist: { models: built, checkedAt: Date.now() } });
+  }
+  return built;
 };
 
 const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConfig[]> => {
@@ -1202,16 +1255,23 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelCon
   const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
   const fmt = cfg.cloudApiFormat || "anthropic-messages";
   const key = readCloudKey();
-  // The login seed must never shadow pi's stored snapshot in the offline phase.
+  // The login seed must never shadow pi's stored snapshot in the cache-only
+  // phase; with no credential nothing is served at all ("Reset all" safety).
   const held = cloudDefs.length && cloudDefs !== CLOUD_LOGIN_SEED
     ? cloudDefs
     : ((context.stored?.models ?? []) as unknown as ProviderModelConfig[]);
-  const defs = key
-    ? (context.allowNetwork
-      ? await loadCloudCatalog(domain, key, !!context.force)
-      : held)
-    : [];
-  return buildCloudModels(defs.length ? defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+  if (!key) return buildCloudModels(CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+  if (!context.allowNetwork) {
+    if (!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) cloudDefs = held;
+    return buildCloudModels(held.length ? held : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+  }
+  const result = await loadCloudCatalog(domain, key, !!context.force);
+  const built = buildCloudModels(result.defs.length ? result.defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+  // One store write per real fetch (see planRefreshModels).
+  if (result.fetched && result.defs.length && result.defs !== CLOUD_LOGIN_SEED) {
+    await context.publish?.({ persist: { models: built, checkedAt: Date.now() } });
+  }
+  return built;
 };
 
 // ── Module-level mutable model lists ─────────────────────────────────
@@ -1298,73 +1358,16 @@ function migrateLegacyAuth() {
 // Async factory: pi awaits this before provider registrations are flushed.
 // Fetch live model catalogs before registerProvider() so enabledModels
 // validation sees the real catalog immediately. No fallbacks.
-export default async function (pi: ExtensionAPI) {
-  migrateLegacyAuth();
-  const config = loadConfig();
-
-  // DashScope reports some transient failures as SSE `server_error` events
-  // over HTTP 200: rate limits with `<429>` in the message, and inference-
-  // backend `Backend buffer overflow` errors. Prefix the assistant error so
-  // modern pi's retry classifier matches it — a bare `Backend buffer
-  // overflow.` carries no retryable marker and would fail the turn at once.
-  pi.on("message_end", (event) => {
-    const { message } = event;
-    if (message.role !== "assistant") return;
-    if (message.stopReason !== "error") return;
-    if (message.provider !== "alibaba-plan" && message.provider !== "alibaba-cloud") return;
-    const errorMessage = message.errorMessage ?? "";
-    const rewritten =
-      rewriteDashScopeRateLimitErrorMessage(errorMessage) ??
-      rewriteDashScopeBackendOverflowMessage(errorMessage);
-    if (!rewritten) return;
-    return { message: { ...message, errorMessage: rewritten } };
-  });
-
-  let planKey: string | null = null;
-  try {
-    const auth = readAuth();
-    planKey = auth["alibaba-plan"]?.access || auth["alibaba-plan"]?.key || null;
-  } catch {}
-  const cloudKey = readCloudKey();
-
-  // ── Live catalog fetch (before provider registration) ───────────────
-  let planCreds: { access?: string; refresh?: string } | undefined;
-  if (planKey) { try { planCreds = readAuth()["alibaba-plan"]; } catch {} }
-  const planEndpoints = resolvePlanEndpoints(planCreds);
-  let cloudDomain = config.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-  const cloudFmt: CloudApiFormat = config.cloudApiFormat || "anthropic-messages";
-
-  // Catalogs before registerProvider(): pi awaits this factory, and
-  // enabledModels validation plus `pi --list-models` want the real catalog
-  // right away. One lightweight catalog GET per launch (never billed);
-  // offline it keeps whatever we hold, and pi's stored snapshot arrives with
-  // the first `refreshModels` phase.
-  if (planCreds?.access) planDefs = await loadPlanCatalog(false);
-  if (cloudKey) {
-    // One-shot endpoint upgrade: shared regional domain → workspace domain.
-    // Pure checks first, so a normal launch pays zero network; on success the
-    // catalog below is fetched from the upgraded domain directly.
-    const up = await upgradeCloudDomainToWorkspace(cloudKey);
-    if (up.status === "upgraded") {
-      console.warn(
-        `[alibaba] Cloud endpoint auto-upgraded to the workspace domain ${up.domain} (WorkspaceId ${up.wsid}) — ` +
-        "Alibaba recommends workspace domains for performance and stability. " +
-        "Manage or undo: /alibaba → Cloud — Auto workspace domain / Change Domain.",
-      );
-      cloudDomain = up.domain;
-    }
-    await loadCloudCatalog(cloudDomain, cloudKey, false);
-  }
-  // Keep the Cloud provider visible in /login even with no models yet (issue #1).
-  if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
-
+// ── Provider registration (shared by boot and session_start) ────────────────
+function registerPlanProvider(pi: ExtensionAPI) {
+  const ep = resolvePlanEndpoints(readAuth()["alibaba-plan"]);
   // ── Plan provider ───────────────────────────────────────────────────
   pi.registerProvider("alibaba-plan", {
     name: "Alibaba Model Studio Plan",
-    baseUrl: planEndpoints.anthropic,
+    baseUrl: ep.anthropic,
     api: "anthropic-messages",
     authHeader: true,
-    models: buildPlanModels(planDefs, planEndpoints.openai, planEndpoints.anthropic, loadConfig().contextWindowOverrides),
+    models: buildPlanModels(planDefs, ep.openai, ep.anthropic, loadConfig().contextWindowOverrides),
     refreshModels: planRefreshModels,
     oauth: {
       name: "Alibaba Model Studio Coding Plan",
@@ -1405,101 +1408,74 @@ export default async function (pi: ExtensionAPI) {
       },
     },
   });
+}
 
+
+function registerCloudProvider(pi: ExtensionAPI) {
+  const cfg = loadConfig();
+  const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
+  const fmt: CloudApiFormat = cfg.cloudApiFormat || "anthropic-messages";
+  const transport = cloudDefaultTransport(domain, fmt);
   // ── Cloud provider ─────────────────────────────────────────────────
-  const cloudTransport = cloudDefaultTransport(cloudDomain, cloudFmt);
-  pi.registerProvider("alibaba-cloud", {
+    pi.registerProvider("alibaba-cloud", {
     name: "Alibaba Cloud (API Key)",
-    baseUrl: cloudTransport.baseUrl,
+    baseUrl: transport.baseUrl,
     apiKey: "$DASHSCOPE_API_KEY",
-    api: cloudTransport.api,
+    api: transport.api,
     authHeader: true,
-    models: buildCloudModels(cloudDefs, cloudDomain, cloudFmt, loadConfig().contextWindowOverrides),
+    models: buildCloudModels(cloudDefs, domain, fmt, cfg.contextWindowOverrides),
     refreshModels: cloudRefreshModels,
   });
+}
+
+export default async function (pi: ExtensionAPI) {
+  migrateLegacyAuth();
+  const config = loadConfig();
+
+  // DashScope reports some transient failures as SSE `server_error` events
+  // over HTTP 200: rate limits with `<429>` in the message, and inference-
+  // backend `Backend buffer overflow` errors. Prefix the assistant error so
+  // modern pi's retry classifier matches it — a bare `Backend buffer
+  // overflow.` carries no retryable marker and would fail the turn at once.
+  pi.on("message_end", (event) => {
+    const { message } = event;
+    if (message.role !== "assistant") return;
+    if (message.stopReason !== "error") return;
+    if (message.provider !== "alibaba-plan" && message.provider !== "alibaba-cloud") return;
+    const errorMessage = message.errorMessage ?? "";
+    const rewritten =
+      rewriteDashScopeRateLimitErrorMessage(errorMessage) ??
+      rewriteDashScopeBackendOverflowMessage(errorMessage);
+    if (!rewritten) return;
+    return { message: { ...message, errorMessage: rewritten } };
+  });
+
+  // Catalogs flow through pi: `refreshModels` serves pi's stored snapshot at
+  // startup (measured: pi calls it in a cache-only phase), and session_start /
+  // "Refresh model lists" fetch under the cross-instance lock and publish the
+  // snapshot to models-store.json exactly once per real fetch. The Cloud
+  // registration falls back to the login seed so it stays visible in /login
+  // with no catalog yet (issue #1).
+  if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
+  registerPlanProvider(pi);
+  registerCloudProvider(pi);
 
   // ── Lazy refresh: fetch live catalogs and re-register ───────────────
-  pi.on("session_start", async () => {
+  // Lazy refresh on session start: the one-shot workspace-domain upgrade, then
+  // pi's own refresh path — our refreshModels handlers fetch under the
+  // cross-instance lock and publish the snapshot once, so parallel pi instances
+  // share one catalog fetch and one models-store.json write.
+  pi.on("session_start", async (_event, ctx) => {
    try {
-    planDefs = await loadPlanCatalog(false);
-
     const key = readCloudKey();
     if (key) {
-      // Covers logging into Cloud mid-process: the boot factory had no key yet.
       const up = await upgradeCloudDomainToWorkspace(key);
       if (up.status === "upgraded") {
         console.warn(`[alibaba] Cloud endpoint auto-upgraded to the workspace domain ${up.domain} (WorkspaceId ${up.wsid}).`);
+        registerCloudProvider(pi); // baseUrl changed
       }
-      const cfg = loadConfig();
-      const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-      await loadCloudCatalog(domain, key, false);
     }
-    // Keep the Cloud provider visible in /login even with no models yet (issue #1).
-    if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
-
-    // Re-register both providers with the expanded model lists
-    const currentConfig = loadConfig();
-    const currentPlanCreds = readAuth()["alibaba-plan"];
-    const ep = resolvePlanEndpoints(currentPlanCreds);
-    const currentDomain = currentConfig.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-    const currentFmt: CloudApiFormat = currentConfig.cloudApiFormat || "anthropic-messages";
-
-    pi.registerProvider("alibaba-plan", {
-      name: "Alibaba Model Studio Plan",
-      baseUrl: ep.anthropic,
-      api: "anthropic-messages",
-      authHeader: true,
-      models: buildPlanModels(planDefs, ep.openai, ep.anthropic, loadConfig().contextWindowOverrides),
-      refreshModels: planRefreshModels,
-      oauth: {
-        name: "Alibaba Model Studio Coding Plan",
-        async login(callbacks) {
-          const key = await callbacks.onPrompt({
-            message: "Coding Plan token (sk-sp-… or sk-tok-…). Run /alibaba afterwards if you need a non-Singapore region:",
-          });
-          if (!isPlanKey(key)) {
-            throw new Error(
-              "This doesn't look like a Coding Plan token (expected sk-sp-… or sk-tok-…). " +
-              "If it's a Cloud API key, run /login → 'Alibaba Cloud (API Key)' instead.",
-            );
-          }
-          const cfg = loadConfig();
-          const openaiUrl = cfg.planOpenAI || DEFAULT_PLAN_OPENAI;
-          const anthropicUrl = cfg.planAnthropic || DEFAULT_PLAN_ANTHROPIC;
-          cfg.planOpenAI = openaiUrl;
-          cfg.planAnthropic = anthropicUrl;
-          saveConfig(cfg);
-          return {
-            access: key,
-            refresh: JSON.stringify({ openai: openaiUrl, anthropic: anthropicUrl }),
-            expires: Date.now() + 365 * 86400_000,
-          };
-        },
-        async refreshToken(c) { return c; },
-        getApiKey(c) { return c.access; },
-        modifyModels(models, credentials) {
-          const ep2 = resolvePlanEndpoints(credentials);
-          const updated = buildPlanModels(planDefs, ep2.openai, ep2.anthropic);
-          return models.map((m) => {
-            if (m.provider !== "alibaba-plan") return m;
-            const found = updated.find((u) => u.id === m.id);
-            if (!found || !found.api) return m;
-            return { ...m, baseUrl: found.baseUrl ?? m.baseUrl, api: found.api };
-          });
-        },
-      },
-    });
-
-    const cloudTransport = cloudDefaultTransport(currentDomain, currentFmt);
-    pi.registerProvider("alibaba-cloud", {
-      name: "Alibaba Cloud (API Key)",
-      baseUrl: cloudTransport.baseUrl,
-      apiKey: "$DASHSCOPE_API_KEY",
-      api: cloudTransport.api,
-      authHeader: true,
-      models: buildCloudModels(cloudDefs, currentDomain, currentFmt, loadConfig().contextWindowOverrides),
-      refreshModels: cloudRefreshModels,
-    });
+    await ctx.modelRegistry.refresh();
    } catch (e: any) {
     console.warn(`[alibaba] session_start catalog refresh failed (${e?.message || e}); keeping previously loaded models.`);
    }
