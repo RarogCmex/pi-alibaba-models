@@ -1,6 +1,7 @@
 import { getAgentDir, type ExtensionAPI, type ProviderModelConfig, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import {
   ALIBABA_TOOLS_PARAMETERS,
   buildSidecarRequest,
@@ -142,6 +143,10 @@ interface AlibabaConfig {
   cloudWorkspaceId?: string;
   // Timestamp of the last failed auto-probe; retried at most once per 24h.
   cloudWorkspaceProbeFailedAt?: number;
+  // Fingerprint (sha256, 16 hex chars) of the Cloud key the endpoint config was
+  // last derived from. A mismatch with the active key triggers the
+  // default→corporate re-derivation (see the Cloud key binding section).
+  cloudKeyFingerprint?: string;
   // Status-only metadata about the last successful catalog fetch (pi's models
   // store keeps the catalogs themselves).
   planFetchedAt?: number;
@@ -1133,6 +1138,157 @@ export async function upgradeCloudDomainToWorkspace(apiKey: string, force = fals
   return { status: "upgraded", domain: target, wsid };
 }
 
+// ── Cloud key binding (key swap → endpoint re-derivation) ────────────
+// A corporate (workspace) endpoint belongs to the key it was derived from:
+// keep it after a key swap and every request 403s on the mismatch. pi writes
+// api-key credentials in its own /login dialog (no extension hook fires on the
+// write), so the swap is caught the first moment the extension observes an
+// unseen key — boot, session_start, or a catalog refresh — and the endpoint is
+// then re-derived from scratch in a fixed order:
+//   1. verify the key against the DEFAULT (shared regional) endpoints first —
+//      the current region's own default first (e.g. the Beijing default
+//      dashscope.aliyuncs.com behind a cn-beijing workspace domain), then the
+//      other sites' defaults (CN ↔ intl ↔ US keys do not cross-authenticate);
+//   2. only then try to upgrade the verified default to the corporate
+//      (workspace) endpoint of the NEW key's own WorkspaceId.
+// The previous key's endpoint is never inherited. Positive probe evidence only
+// (the same rule as the boot auto-upgrade): a total outage changes nothing and
+// the binding retries on the next run.
+
+// Fingerprint of a key — records WHICH key the endpoint config was derived
+// from without ever storing the key itself (auth.json stays the only key store).
+export function cloudKeyFingerprint(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+// Pure: does the active key still match the one the Cloud endpoint config was
+// last derived from? A missing fingerprint (pre-upgrade install, or a key
+// written before this guard existed) also counts as "derive once".
+export function cloudKeyNeedsRebinding(
+  cfg: { cloudKeyFingerprint?: string },
+  key: string | null | undefined,
+): boolean {
+  if (!key) return false;
+  return cfg.cloudKeyFingerprint !== cloudKeyFingerprint(key);
+}
+
+// Ordered default (shared regional) endpoints to verify a fresh key against:
+// the configured domain's own region default first (e.g. the Beijing default
+// behind a cn-beijing workspace domain), then the other sites' defaults. Domains
+// with no shared default of their own (Tokyo/Frankfurt workspaces, HK, custom)
+// start from the international default.
+export function defaultCloudDomainsFor(domain: string): string[] {
+  const current = domain.trim().toLowerCase();
+  const region = parseWorkspaceCloudDomain(current)?.region ?? regionForSharedCloudDomain(current);
+  const primary = (region ? REGION_SHARED_DOMAINS[region] : null) ?? DEFAULT_CLOUD_DOMAIN;
+  return [primary, ...Object.values(REGION_SHARED_DOMAINS).filter((d) => d !== primary)];
+}
+
+export type CloudKeyRebindResult =
+  | { status: "rebound"; domain: string; upgrade: WorkspaceUpgradeResult }
+  | { status: "unchanged"; reason: string }
+  | { status: "failed"; reason: string };
+
+// Detect → verify the default → upgrade to corporate, persisting after every
+// positive result. Runs at most once per observed key (see the guard below).
+export async function rebindCloudEndpointToKey(apiKey: string): Promise<CloudKeyRebindResult> {
+  const cfg = loadConfig();
+  const current = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
+  // Hong Kong and custom hosts are explicit, key-independent user config —
+  // never re-derived (the boot auto-upgrade leaves them alone for the same
+  // reason). Just bind the key so the swap is not re-processed forever.
+  if (!regionForSharedCloudDomain(current) && !parseWorkspaceCloudDomain(current)) {
+    cfg.cloudKeyFingerprint = cloudKeyFingerprint(apiKey);
+    saveConfig(cfg);
+    return { status: "unchanged", reason: `${current} is not a shared or workspace domain — kept as configured` };
+  }
+  // Remember a workspace's home region: Tokyo/Frankfurt workspaces have no
+  // shared domain to derive one from, and a same-workspace key swap must not
+  // drift the endpoint to another region's suffix.
+  const prevWs = parseWorkspaceCloudDomain(current);
+
+  // Step 1: the key is proven against the default endpoints first — the old
+  // corporate domain is stale by definition once the key changes, so it is
+  // never even consulted here.
+  let base: string | null = null;
+  for (const shared of defaultCloudDomainsFor(current)) {
+    if (await probeWorkspaceDomain(shared, apiKey)) { base = shared; break; }
+  }
+  if (!base) {
+    return { status: "failed", reason: `no default endpoint accepted the new key — ${current} left untouched` };
+  }
+  cfg.cloudDomain = base;
+  // The cached WorkspaceId belongs to the PREVIOUS key: drop it so it cannot
+  // come back as a fallback and park the new key under the old workspace.
+  delete cfg.cloudWorkspaceId;
+  delete cfg.cloudWorkspaceProbeFailedAt;
+  cfg.cloudKeyFingerprint = cloudKeyFingerprint(apiKey);
+  saveConfig(cfg);
+
+  // Step 2: try to upgrade the verified default to the corporate endpoint.
+  if (cfg.cloudAutoWorkspaceDomain === false) {
+    return {
+      status: "rebound",
+      domain: base,
+      upgrade: { status: "unchanged", reason: `auto-upgrade is disabled — staying on the verified default ${base}` },
+    };
+  }
+  const wsid = await detectCloudWorkspaceId(base, apiKey);
+  const region = regionForSharedCloudDomain(base);
+  if (!wsid || !region) {
+    cfg.cloudWorkspaceProbeFailedAt = Date.now();
+    saveConfig(cfg);
+    return {
+      status: "rebound",
+      domain: base,
+      upgrade: { status: "failed", reason: "no workspace_id discoverable for the new key — staying on the verified default" },
+    };
+  }
+  // No fallback to the previous key's WorkspaceId here: the detection above is
+  // the only source, so a corporate endpoint always matches the active key.
+  const target = workspaceDomain(wsid, prevWs && prevWs.wsid === wsid ? prevWs.region : region);
+  if (!(await probeWorkspaceDomain(target, apiKey))) {
+    cfg.cloudWorkspaceProbeFailedAt = Date.now();
+    saveConfig(cfg);
+    return {
+      status: "rebound",
+      domain: base,
+      upgrade: { status: "failed", reason: `${target} did not answer the probe — staying on the verified default` },
+    };
+  }
+  cfg.cloudWorkspaceId = wsid;
+  cfg.cloudDomain = target;
+  delete cfg.cloudWorkspaceProbeFailedAt;
+  saveConfig(cfg);
+  return { status: "rebound", domain: target, upgrade: { status: "upgraded", domain: target, wsid } };
+}
+
+// Per-process guard: one derivation per observed key (boot, session_start and
+// the catalog refresh all ask), retried on the next run after a failure instead
+// of hammered. Re-login Cloud / Reset all clear it.
+let rebindAttemptedFingerprint: string | null = null;
+export function resetCloudKeyBindingGuard() { rebindAttemptedFingerprint = null; }
+
+async function ensureCloudEndpointBound(apiKey: string): Promise<void> {
+  try {
+    const fp = cloudKeyFingerprint(apiKey);
+    if (rebindAttemptedFingerprint === fp) return;
+    rebindAttemptedFingerprint = fp;
+    if (!cloudKeyNeedsRebinding(loadConfig(), apiKey)) return;
+    const res = await rebindCloudEndpointToKey(apiKey);
+    if (res.status === "rebound") {
+      const how = res.upgrade.status === "upgraded"
+        ? `corporate endpoint ${res.domain} (WorkspaceId ${res.upgrade.wsid})`
+        : `${res.domain} (${res.upgrade.reason})`;
+      console.warn(`[alibaba] Cloud API key changed — endpoint re-derived via the default endpoint: ${how}.`);
+    } else if (res.status === "failed") {
+      console.warn(`[alibaba] Cloud endpoint not re-derived for the new API key: ${res.reason}.`);
+    }
+  } catch (e: any) {
+    console.warn(`[alibaba] Cloud endpoint re-derivation failed (${e?.message || e}).`);
+  }
+}
+
 // ── Cloud login seed ─────────────────────────────────────────────────
 // pi hides any provider that has zero registered models, so with no
 // credential at all the Cloud provider would vanish from /login → "Use an
@@ -1319,10 +1475,13 @@ const planRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConf
 };
 
 const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConfig[]> => {
+  const key = readCloudKey();
+  // A key written since the last run re-derives the endpoint before any fetch;
+  // the models returned below carry the rebuilt baseUrl, so pi heals in one pass.
+  if (key && context.allowNetwork) await ensureCloudEndpointBound(key);
   const cfg = loadConfig();
   const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
   const fmt = cfg.cloudApiFormat || DEFAULT_CLOUD_FORMAT;
-  const key = readCloudKey();
   // The login seed must never shadow pi's stored snapshot in the cache-only
   // phase; with no credential nothing is served at all ("Reset all" safety).
   const held = cloudDefs.length && cloudDefs !== CLOUD_LOGIN_SEED
@@ -1535,6 +1694,9 @@ export default async function (pi: ExtensionAPI) {
   seedFromSnapshot();
   const planCred = readAuth()["alibaba-plan"];
   const bootKey = readCloudKey();
+  // A swapped key re-derives the Cloud endpoint (default first, then corporate)
+  // before any fetch can hit the previous key's endpoint.
+  if (bootKey) await ensureCloudEndpointBound(bootKey);
   if (!planDefs.length && planCred?.access) await loadPlanCatalog(true);
   if ((!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) && bootKey) {
     await loadCloudCatalog(loadConfig().cloudDomain || DEFAULT_CLOUD_DOMAIN, bootKey, true);
@@ -1554,11 +1716,15 @@ export default async function (pi: ExtensionAPI) {
    try {
     const key = readCloudKey();
     if (key) {
+      const before = loadConfig().cloudDomain || DEFAULT_CLOUD_DOMAIN;
+      // A swapped key re-derives the endpoint first (default → corporate); the
+      // boot auto-upgrade then takes a plain shared domain the rest of the way.
+      await ensureCloudEndpointBound(key);
       const up = await upgradeCloudDomainToWorkspace(key);
       if (up.status === "upgraded") {
         console.warn(`[alibaba] Cloud endpoint auto-upgraded to the workspace domain ${up.domain} (WorkspaceId ${up.wsid}).`);
-        registerCloudProvider(pi); // baseUrl changed
       }
+      if ((loadConfig().cloudDomain || DEFAULT_CLOUD_DOMAIN) !== before) registerCloudProvider(pi); // baseUrl changed
     }
     await ctx.modelRegistry.refresh();
    } catch (e: any) {
@@ -1656,6 +1822,12 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Re-login Cloud") {
         if (!await ctx.ui.confirm("Wipe Cloud credentials and re-login?", "Removes alibaba-cloud from auth.json")) return;
         authStore(ctx).remove("alibaba-cloud");
+        // The replacement key is a NEW binding: drop the fingerprint so its
+        // endpoint is re-derived (default first, then corporate) on first use.
+        const rebindCfg = loadConfig();
+        delete rebindCfg.cloudKeyFingerprint;
+        saveConfig(rebindCfg);
+        resetCloudKeyBindingGuard();
         ctx.ui.notify("Cloud credentials wiped. Run /login → Use an API key → Alibaba Cloud (API Key).", "info");
         await ctx.reload();
         return;
@@ -1950,6 +2122,7 @@ export default async function (pi: ExtensionAPI) {
         for (const k of ["alibaba", "alibaba-plan", "alibaba-cloud", "alibaba-studio", "alibaba-token", "dashscope"]) {
           store.remove(k);
         }
+        resetCloudKeyBindingGuard();
         // Also strip stale alibaba-* / dashscope-* model ids from settings.json enabledModels,
         // and clear defaultProvider/defaultModel if they reference alibaba (otherwise pi would
         // try to default-launch into a now-missing provider).
@@ -2007,6 +2180,7 @@ export default async function (pi: ExtensionAPI) {
         if (!key) {
           throw new Error("No Cloud API key. Run /login → Alibaba Cloud (API Key) or set $DASHSCOPE_API_KEY.");
         }
+        await ensureCloudEndpointBound(key);
         const live = loadConfig();
         const domain = live.cloudDomain || DEFAULT_CLOUD_DOMAIN;
         const picked = pickSidecarModel({

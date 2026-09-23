@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1
+
+Replacing the Cloud API key re-derives the endpoint instead of inheriting the previous key's.
+
+- **Key swap → endpoint re-derived, default first.** A corporate (workspace) endpoint belongs to the key it was derived from; keeping it after a key swap turned every request into `403`. pi's `/login` API-key write fires no extension hook, so the swap is caught the first time the extension observes an unseen key (boot, `session_start`, or a catalog refresh) and the endpoint is re-derived in a fixed order: (1) the key is verified against the **default** (shared regional) endpoints first — the current region's own default first (e.g. the Beijing default `dashscope.aliyuncs.com`), then the other sites' defaults, since CN ↔ International ↔ US keys do not cross-authenticate — and the endpoint lands on whichever default accepts it; (2) only then is the verified default upgraded to the **corporate (workspace) endpoint** of the new key's own WorkspaceId.
+- **One derivation per key, positive evidence only.** The binding is a key fingerprint in `alibaba-config.json` (the key itself stays in `auth.json`); the derivation runs at most once per key and costs nothing afterwards. Endpoints switch only on live probes — offline or an invalid key leaves the config untouched and retries on the next run. The stale `cloudWorkspaceId` cache is dropped so the new key cannot be parked under the old workspace, the 24h probe backoff resets for the new key, a same-workspace swap keeps the workspace's home region (Tokyo / Frankfurt don't drift to another region's suffix), and the auto-upgrade opt-out is respected (verified default only). Hong Kong and custom domains are key-independent and never touched. `Re-login Cloud` clears the binding so the replacement key is re-derived immediately. Tests cover the pure binding decision, the fingerprint, and the default-endpoint ordering (`tests/key-rebind.test.ts`).
+
 ## 1.5.0
 
 **The default Cloud wire format is now `openai-responses`** — a deliberate MINOR bump: the API surface is unchanged and per-model fallbacks remain, but what you get out of the box changes.
