@@ -331,6 +331,36 @@ describe("per-family capability table", () => {
   });
 });
 
+describe("prompt caching + DashScope session cache", () => {
+  it("declares a 5-minute prompt-cache lifetime on caching-capable families", () => {
+    // DashScope's ephemeral window is 5 minutes and renews on a hit; `short`
+    // is the conservative end of that range and makes the model eligible for
+    // pi's cache warming (global `cacheWarming` setting, default streaming).
+    const [cloud] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
+    assert.deepEqual(cloud.promptCache, { short: 300 });
+  });
+
+  it("declares nothing for the open-weight qwen3-b line (no documented caching)", () => {
+    const openWeight = { ...reasoningQwen, id: "qwen3-30b-a3b", maxTokens: 0 };
+    const [cloud] = buildCloudModels([openWeight], "dashscope.example", "anthropic-messages");
+    assert.equal(cloud.promptCache, undefined);
+  });
+
+  it("opts Responses requests into DashScope session cache — and only those", () => {
+    // Session cache gives predictable multi-turn prefix hits (5-min window
+    // renewed on hit, reads ~10% vs the implicit cache's 20–25%) and is
+    // opt-in per request; the docs cover the Responses endpoint only.
+    const [responses] = buildCloudModels([reasoningQwen], "dashscope.example", "openai-responses");
+    assert.deepEqual((responses as { headers?: Record<string, string> }).headers, {
+      "x-dashscope-session-cache": "enable",
+    });
+    const [completions] = buildCloudModels([reasoningQwen], "dashscope.example", "openai-completions");
+    assert.equal((completions as { headers?: Record<string, string> }).headers, undefined);
+    const [anthropic] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
+    assert.equal((anthropic as { headers?: Record<string, string> }).headers, undefined);
+  });
+});
+
 describe("isVisionModel", () => {
   it("flags VL, Qwen 3.x Plus, Qwen 3.8, and Kimi", () => {
     assert.equal(isVisionModel("qwen-vl-max"), true);

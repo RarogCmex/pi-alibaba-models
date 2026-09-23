@@ -1,6 +1,12 @@
 # Changelog
 
-## 1.4.5
+## 1.4.6
+
+Caching and cache warming move onto pi 0.86+ built-ins.
+
+- **Model catalogs use pi's models store instead of private cache files.** Both providers expose `refreshModels(context)`: pi persists the returned snapshot, hands it back as `context.stored` for offline/cache-only initialization, and gates network refreshes with its own freshness checks (`force` bypasses them — `/alibaba → Refresh model lists` now calls `ctx.modelRegistry.refresh({force: true})`). The 4h-TTL JSON caches, `isCacheFresh`, and the `rehydrate*` loaders are gone (~120 lines less); a failed fetch keeps the previous list, and with no credential nothing is served at all, so "Reset all" leaves no ghosts behind. Card capabilities are now derived in one place (`deriveCard`) and therefore re-derived even for a store snapshot — extension updates and context-window overrides apply without waiting for a network fetch. Legacy cache files are deleted on sight.
+- **Prompt-cache warming (pi `cacheWarming`).** Caching-capable families declare `promptCache: {short: 300}` — the conservative end of DashScope's documented 5-minute ephemeral window (renewed on hit; no `long` tier is published) — which makes them eligible for pi's idle/streaming prompt-cache warming. The open-weight `qwen3-<size>b` line has no documented caching and is never warmed.
+- **DashScope session cache on Cloud Responses.** Requests carry `x-dashscope-session-cache: enable`, giving predictable multi-turn prefix hits server-side (reads ~10% vs the implicit cache's 20–25%, writes 125%, 5-min window renewed on hit; the client still sends the full history). Documented for the Responses endpoint only — models re-routed to Completions stay unmarked.
 
 Code-review follow-up to 1.4.4 (standards + spec axes): factual corrections, one capability table, one `max_tokens` resolver. No live calls were billed for this release — the capability facts were re-verified against the published DashScope docs (Chat Completions / Responses / GLM / DeepSeek pages) and pi 0.87's own `thinkingLevelMap` handling, and the maps are asserted in tests (75 pass).
 

@@ -24,13 +24,18 @@ import {
 const HOME_DIR = getAgentDir();
 const CONFIG_PATH = path.join(HOME_DIR, "alibaba-config.json");
 const AUTH_PATH = path.join(HOME_DIR, "auth.json");
-const PLAN_CACHE_PATH = path.join(HOME_DIR, "alibaba-plan-models.cache.json");
-// v2 filename: rows now store the catalog's `max_output_tokens` or 0. Caches
-// written before 1.4.5 stored id-based guesses there, which would otherwise
-// masquerade as catalog rows after the upgrade.
-const CLOUD_CACHE_PATH = path.join(HOME_DIR, "alibaba-cloud-models.cache.v2.json");
-
-const MODELS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+// Model catalogs live in pi's own models store: `refreshModels` returns them,
+// pi persists the snapshot and hands it back as `context.stored` for
+// offline/cache-only initialization. The extension's own cache files are gone
+// — these names survive only so upgrades and "Reset all" can delete leftovers.
+const LEGACY_CACHE_PATHS = [
+  path.join(HOME_DIR, "alibaba-plan-models.cache.json"),
+  path.join(HOME_DIR, "alibaba-cloud-models.cache.json"),
+  path.join(HOME_DIR, "alibaba-cloud-models.cache.v2.json"),
+];
+const removeLegacyCaches = () => {
+  for (const p of LEGACY_CACHE_PATHS) { try { fs.unlinkSync(p); } catch {} }
+};
 
 // ── Thinking levels (measured against the live endpoint) ─────────────
 //
@@ -123,6 +128,11 @@ interface AlibabaConfig {
   cloudWorkspaceId?: string;
   // Timestamp of the last failed auto-probe; retried at most once per 24h.
   cloudWorkspaceProbeFailedAt?: number;
+  // Status-only metadata about the last successful catalog fetch (pi's models
+  // store keeps the catalogs themselves).
+  planFetchedAt?: number;
+  cloudFetchedAt?: number;
+  cloudAuthorizedFilteredLast?: boolean;
 }
 
 const readJSON = <T>(p: string, fallback: T): T => {
@@ -174,8 +184,7 @@ interface PlanModelDef {
   catalogMaxTokens?: number;
 }
 
-// ── Plan model fetch + parse + cache ──────────────────────────────────
-interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[]; }
+// ── Plan model fetch + parse ──────────────────────────────────────────
 
 // ── Capability heuristics (shared by Plan + Cloud) ───────────────────
 // The /models API only returns ids/names, not capabilities — so context
@@ -298,6 +307,27 @@ function mergeCompat(
     : ((tc?.compat ?? base) as ProviderModelConfig["compat"]);
 }
 
+// Every card capability is derived from the id here (plus real catalog or
+// context-window rows), so a snapshot re-served from pi's store is re-derived
+// too — extension updates and the user's context-window overrides apply
+// without waiting for the next network fetch. Pure: overrides come from the
+// caller, never from disk.
+function deriveCard(
+  id: string,
+  m: { input?: ("text" | "image")[]; contextWindow?: number },
+  overrides?: Record<string, number>,
+) {
+  const override = overrides?.[id] ?? overrides?.["*"];
+  const vision = isVisionModel(id) || m.input?.includes("image");
+  return {
+    reasoning: isReasoningModel(id),
+    input: (vision ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+    contextWindow: typeof override === "number" && override > 0
+      ? override
+      : (m.contextWindow && m.contextWindow > 0 ? m.contextWindow : inferContextWindow(id, overrides)),
+  };
+}
+
 // ── Per-family capability table ──────────────────────────────────────
 // Chat Completions (`reasoning_effort`, plus `enable_thinking` on the `qwen`
 // thinking format) and Responses (`reasoning.effort`) accept a different
@@ -364,35 +394,38 @@ interface FamilyCaps {
   responses?: Levels;
   /** /responses can serve this family at all (measured 2026-09-22). */
   responsesCapable?: boolean;
+  /** DashScope prompt caching documented for this family. */
+  cache?: boolean;
 }
 
 // One row per family — the single place a new family or snapshot touches.
 // Order matters: the first match wins, most specific id first.
 const FAMILIES: Array<[RegExp, FamilyCaps]> = [
-  [/^qwen3\.8-2\.4t/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true }],
-  [/^qwen3\.7-max-(preview|\d{4}-\d{2}-\d{2})/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true }],
-  [/^qwen3\.8/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
-  [/^qwen3\.7-(max|plus)/i, { reasoning: true, completions: L_NO_MAX, responsesCapable: true }],
-  [/^qwen3\.[5-7]/i, { reasoning: true, completions: L_NO_MAX, responses: L_MEDIUM_CEILING, responsesCapable: true }],
-  [/^qwen3-max|^qwen3-(coder|next)/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
+  [/^qwen3\.8-2\.4t/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true, cache: true }],
+  [/^qwen3\.7-max-(preview|\d{4}-\d{2}-\d{2})/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true, cache: true }],
+  [/^qwen3\.8/i, { reasoning: true, completions: L_ALL, responsesCapable: true, cache: true }],
+  [/^qwen3\.7-(max|plus)/i, { reasoning: true, completions: L_NO_MAX, responsesCapable: true, cache: true }],
+  [/^qwen3\.[5-7]/i, { reasoning: true, completions: L_NO_MAX, responses: L_MEDIUM_CEILING, responsesCapable: true, cache: true }],
+  [/^qwen3-max|^qwen3-(coder|next)/i, { reasoning: true, completions: L_ALL, responsesCapable: true, cache: true }],
+  // Open-weight qwen3-<size>b: no prompt caching documented (qwen3-30b-a3b).
   [/^qwen3-\d/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
-  [/^qwen-(plus|flash)(-|$)/i, { reasoning: true, completions: L_ALL, responses: L_NONE_ONLY, responsesCapable: true }],
-  [/^qwen-turbo(-|$)/i, { reasoning: false, completions: L_ALL, responses: L_NONE_ONLY, responsesCapable: true }],
-  [/^glm-?5\.3/i, { reasoning: true, completions: L_GLM53, responsesCapable: true }],
-  [/^glm-?5\.2/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
-  [/^glm-?4\.6/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
-  [/^glm-?4\.5/i, { reasoning: true, completions: L_ALL, effort: false, responses: L_ALWAYS_ON }],
-  [/^glm-?5\.1|^glm-?5\b/i, { reasoning: true, completions: L_NO_MAX }],
-  [/^glm/i, { reasoning: true, completions: L_ALL }],
-  [/^deepseek-?v4\.1/i, { reasoning: true, completions: L_DEEPSEEK_V41, responsesCapable: true }],
-  [/^deepseek-?v4/i, { reasoning: true, completions: L_DEEPSEEK_V4, responsesCapable: true }],
-  [/^deepseek-?v3\.1/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
-  [/^deepseek/i, { reasoning: true, completions: L_ALL }],
-  [/^minimax-?m2\.5/i, { reasoning: true, completions: L_MINIMAX25 }],
-  [/^minimax-?m2\.1/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true }],
-  [/^minimax/i, { reasoning: true, completions: L_ALL }],
-  [/^kimi-k3/i, { reasoning: false, completions: L_ALL, responsesCapable: true }],
-  [/^kimi/i, { reasoning: false, completions: L_NO_MAX }],
+  [/^qwen-(plus|flash)(-|$)/i, { reasoning: true, completions: L_ALL, responses: L_NONE_ONLY, responsesCapable: true, cache: true }],
+  [/^qwen-turbo(-|$)/i, { reasoning: false, completions: L_ALL, responses: L_NONE_ONLY, responsesCapable: true, cache: true }],
+  [/^glm-?5\.3/i, { reasoning: true, completions: L_GLM53, responsesCapable: true, cache: true }],
+  [/^glm-?5\.2/i, { reasoning: true, completions: L_ALL, responsesCapable: true, cache: true }],
+  [/^glm-?4\.6/i, { reasoning: true, completions: L_ALL, responsesCapable: true, cache: true }],
+  [/^glm-?4\.5/i, { reasoning: true, completions: L_ALL, effort: false, responses: L_ALWAYS_ON, cache: true }],
+  [/^glm-?5\.1|^glm-?5\b/i, { reasoning: true, completions: L_NO_MAX, cache: true }],
+  [/^glm/i, { reasoning: true, completions: L_ALL, cache: true }],
+  [/^deepseek-?v4\.1/i, { reasoning: true, completions: L_DEEPSEEK_V41, responsesCapable: true, cache: true }],
+  [/^deepseek-?v4/i, { reasoning: true, completions: L_DEEPSEEK_V4, responsesCapable: true, cache: true }],
+  [/^deepseek-?v3\.1/i, { reasoning: true, completions: L_ALL, responsesCapable: true, cache: true }],
+  [/^deepseek/i, { reasoning: true, completions: L_ALL, cache: true }],
+  [/^minimax-?m2\.5/i, { reasoning: true, completions: L_MINIMAX25, cache: true }],
+  [/^minimax-?m2\.1/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true, cache: true }],
+  [/^minimax/i, { reasoning: true, completions: L_ALL, cache: true }],
+  [/^kimi-k3/i, { reasoning: false, completions: L_ALL, responsesCapable: true, cache: true }],
+  [/^kimi/i, { reasoning: false, completions: L_NO_MAX, cache: true }],
 ];
 
 const DEFAULT_CAPS: FamilyCaps = { completions: L_ALL };
@@ -400,6 +433,18 @@ function capsFor(id: string): FamilyCaps {
   for (const [match, caps] of FAMILIES) if (match.test(id)) return caps;
   return DEFAULT_CAPS;
 }
+
+// DashScope prompt caching (help.aliyun.com/zh/model-studio/context-cache):
+// implicit caching is on for these families, and the explicit
+// `cache_control: {type: "ephemeral"}` window is 5 minutes, renewed on a hit —
+// no longer tier is published. `short: 300` is the conservative end of that
+// window; it makes the model eligible for pi's cache warming (the global
+// `cacheWarming` setting decides off/streaming/idle). `long` stays unset —
+// there is no published 1h-class lifetime. The open-weight qwen3-<size>b line
+// has no caching at all and unknown families stay ineligible.
+const PROMPT_CACHE: NonNullable<ProviderModelConfig["promptCache"]> = { short: 300 };
+const promptCacheFor = (id: string): ProviderModelConfig["promptCache"] =>
+  capsFor(id).cache ? PROMPT_CACHE : undefined;
 
 const OPENAI_BASE_COMPAT = {
   thinkingFormat: "qwen" as const,
@@ -508,9 +553,6 @@ async function fetchPlanModels(_force = false, credentials?: { access?: string; 
   if (!credentials?.access) return [];
   const apiModels = await fetchPlanModelsFromAPI(credentials);
   if (!apiModels.length) throw new Error("Plan model fetch returned no chat models");
-  const ep = resolvePlanEndpoints(credentials);
-  const cache: PlanCache = { fetchedAt: Date.now(), source: `${ep.openai}/models`, models: apiModels };
-  writeJSON(PLAN_CACHE_PATH, cache);
   return apiModels;
 }
 
@@ -529,15 +571,21 @@ function resolvePlanEndpoints(credentials?: { access?: string; refresh?: string 
   };
 }
 
-export function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthropicUrl: string): ProviderModelConfig[] {
+export function buildPlanModels(
+  defs: PlanModelDef[],
+  openaiUrl: string,
+  anthropicUrl: string,
+  overrides?: Record<string, number>,
+): ProviderModelConfig[] {
   return defs.map((m) => {
     const useOpenAI = !!m.openaiOnly || /deepseek/i.test(m.id);
     const api = (useOpenAI ? "openai-completions" : "anthropic-messages") as "anthropic-messages" | "openai-completions";
     const tc = thinkingConfigFor(m.id, api);
     return {
-      id: m.id, name: m.name, reasoning: m.reasoning, input: m.input,
-      contextWindow: m.contextWindow,
+      id: m.id, name: m.name,
+      ...deriveCard(m.id, m, overrides),
       maxTokens: resolveMaxTokens(m.id, api, m.catalogMaxTokens),
+      promptCache: promptCacheFor(m.id),
       compat: mergeCompat(m.compat, tc, useOpenAI),
       thinkingLevelMap: tc?.thinkingLevelMap,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -548,12 +596,6 @@ export function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthrop
 }
 
 // ── Cloud builders ────────────────────────────────────────────────────
-interface CloudCache {
-  fetchedAt: number;
-  domain: string;
-  models: ProviderModelConfig[];
-  authorizedOnly?: boolean;
-}
 
 interface ApiV1Model {
   model: string;
@@ -712,7 +754,7 @@ async function fetchCloudAuthorizedModels(domain: string, apiKey: string): Promi
   } finally { clearTimeout(t); }
 }
 
-async function fetchCloudModels(domain: string, apiKey: string, _force = false): Promise<ProviderModelConfig[]> {
+async function fetchCloudModels(domain: string, apiKey: string, _force = false): Promise<{ models: ProviderModelConfig[]; authorizedOnly: boolean }> {
   const v1 = await fetchCloudModelsV1(domain, apiKey);
   if (v1) {
     let models = v1;
@@ -723,14 +765,9 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
       models = filtered.models;
       authorizedOnly = filtered.authorizedOnly;
     }
-    const cache: CloudCache = { fetchedAt: Date.now(), domain, models, authorizedOnly };
-    writeJSON(CLOUD_CACHE_PATH, cache);
-    return models;
+    return { models, authorizedOnly };
   }
-  const models = await fetchCloudModelsCompat(domain, apiKey);
-  const cache: CloudCache = { fetchedAt: Date.now(), domain, models, authorizedOnly: false };
-  writeJSON(CLOUD_CACHE_PATH, cache);
-  return models;
+  return { models: await fetchCloudModelsCompat(domain, apiKey), authorizedOnly: false };
 }
 
 interface ApiV1QuotaLimit {
@@ -808,7 +845,12 @@ function cloudDefaultTransport(domain: string, fmt: CloudApiFormat): { api: Clou
   };
 }
 
-export function buildCloudModels(models: ProviderModelConfig[], domain: string, fmt: string): ProviderModelConfig[] {
+export function buildCloudModels(
+  models: ProviderModelConfig[],
+  domain: string,
+  fmt: string,
+  overrides?: Record<string, number>,
+): ProviderModelConfig[] {
   const format = (fmt as CloudApiFormat) || "anthropic-messages";
   return models.map((m) => {
     const api = resolveCloudApi(m.id, format);
@@ -816,9 +858,16 @@ export function buildCloudModels(models: ProviderModelConfig[], domain: string, 
     const openai = api !== "anthropic-messages";
     return {
       ...m,
+      ...deriveCard(m.id, m, overrides),
       maxTokens: resolveMaxTokens(m.id, api, m.maxTokens),
+      promptCache: promptCacheFor(m.id),
       thinkingLevelMap: tc?.thinkingLevelMap,
       compat: mergeCompat(m.compat, tc, openai),
+      // DashScope's session cache makes multi-turn prefix hits predictable on
+      // Responses (5-min window renewed on hit, reads billed at ~10% instead
+      // of the implicit cache's indeterminate TTL and 20–25% reads) and is
+      // opt-in per request. Models re-routed to Completions stay unmarked.
+      headers: api === "openai-responses" ? { "x-dashscope-session-cache": "enable" } : undefined,
       baseUrl: openai ? `https://${domain}/compatible-mode/v1` : `https://${domain}/apps/anthropic`,
       api,
     };
@@ -1078,88 +1127,80 @@ const CLOUD_LOGIN_SEED: ProviderModelConfig[] = [{
 }];
 
 // ── Offline-resilient catalog loaders ────────────────────────────────
-// The on-disk cache is both a fast path and a failure fallback:
-//   • fresh cache (< MODELS_CACHE_TTL_MS) and not `force` → serve it, skip
-//     the network. pi awaits this loader before registering providers, so
-//     an unconditional fetch put a cross-region round trip in front of
-//     every launch (and session_start used to do it again).
-//   • stale cache, missing cache, or `force` → fetch live; the response
-//     always wins and rewrites the cache. A network failure falls back to
-//     the stale cache, warns, and never throws.
-const cacheAgeMin = (fetchedAt: number) => Math.round((Date.now() - fetchedAt) / 60000);
+// ── Catalog loading + refresh (pi-owned storage) ───────────────────────
+// pi persists whatever `refreshModels` returns in its models store and hands
+// the snapshot back as `context.stored` during offline/cache-only
+// initialization; its own freshness checks decide when a network refresh is
+// due (`force` bypasses them). There is no cache file and no TTL policy here:
+// we fetch and derive, pi stores and re-serves.
 
-export const isCacheFresh = (fetchedAt?: number, now = Date.now()): boolean =>
-  typeof fetchedAt === "number" && Number.isFinite(fetchedAt) && now - fetchedAt < MODELS_CACHE_TTL_MS;
+type RefreshCtx = {
+  allowNetwork: boolean;
+  force?: boolean;
+  signal?: AbortSignal;
+  stored?: { models?: readonly ProviderModelConfig[] };
+};
 
-function rehydratePlan(models: PlanModelDef[]): PlanModelDef[] {
-  const overrides = loadConfig().contextWindowOverrides;
-  return models.map((m) => {
-    const fresh = inferPlanDef(m.id, overrides);
-    return {
-      ...m,
-      reasoning: fresh.reasoning,
-      input: fresh.input,
-      contextWindow: fresh.contextWindow,
-      compat: fresh.compat,
-      openaiOnly: fresh.openaiOnly,
-    };
-  });
-}
-
-function rehydrateCloud(models: ProviderModelConfig[]): ProviderModelConfig[] {
-  const overrides = loadConfig().contextWindowOverrides;
-  return models.map((m) => {
-    const reasoning = isReasoningModel(m.id);
-    const vision = isVisionModel(m.id) || m.input?.includes("image");
-    const override = overrides?.[m.id] ?? overrides?.["*"];
-    return {
-      ...m,
-      reasoning,
-      input: vision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
-      contextWindow: typeof override === "number" && override > 0
-        ? override
-        : (m.contextWindow > 0 ? m.contextWindow : inferContextWindow(m.id, overrides)),
-      // Keep a real catalog row as-is; 0 stays 0 ("no catalog row") so a
-      // guessed ceiling is never passed off as one. Builders resolve display.
-      maxTokens: m.maxTokens > 0 ? m.maxTokens : 0,
-    };
-  });
-}
-
-async function loadPlanDefs(force: boolean, credentials?: { access?: string; refresh?: string }): Promise<PlanModelDef[]> {
-  if (!credentials?.access) return [];
-  const cache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-  if (!force && cache?.models?.length && isCacheFresh(cache.fetchedAt)) return rehydratePlan(cache.models);
+// Best-effort fetch: a failure keeps whatever we already hold and warns.
+async function loadPlanCatalog(force: boolean): Promise<PlanModelDef[]> {
   try {
-    return await fetchPlanModels(force, credentials);
+    const defs = await fetchPlanModels(force, readAuth()["alibaba-plan"]);
+    planDefs = defs;
+    const cfg = loadConfig();
+    cfg.planFetchedAt = Date.now();
+    saveConfig(cfg);
+    return defs;
   } catch (e: any) {
-    if (cache?.models?.length) {
-      console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); using cached models (${cache.models.length}, ${cacheAgeMin(cache.fetchedAt)}m old).`);
-      return rehydratePlan(cache.models);
-    }
-    console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); no cache — Plan models unavailable until reconnected. Other providers still work.`);
-    return [];
+    console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); keeping ${planDefs.length} previously loaded models.`);
+    return planDefs;
   }
 }
 
-async function loadCloudDefs(domain: string, apiKey: string, force: boolean): Promise<ProviderModelConfig[]> {
-  const cache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
-  const usable = cache?.models?.length && cache.domain === domain ? cache : null;
-  if (!force && usable && isCacheFresh(usable.fetchedAt)) return rehydrateCloud(usable.models);
+async function loadCloudCatalog(domain: string, apiKey: string, force: boolean): Promise<ProviderModelConfig[]> {
   try {
-    return await fetchCloudModels(domain, apiKey, force);
+    const { models, authorizedOnly } = await fetchCloudModels(domain, apiKey, force);
+    cloudDefs = models.length ? models : CLOUD_LOGIN_SEED;
+    const cfg = loadConfig();
+    cfg.cloudFetchedAt = Date.now();
+    cfg.cloudAuthorizedFilteredLast = authorizedOnly;
+    saveConfig(cfg);
+    return cloudDefs;
   } catch (e: any) {
-    if (usable) {
-      console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); using cached models (${usable.models.length}, ${cacheAgeMin(usable.fetchedAt)}m old).`);
-      return rehydrateCloud(usable.models);
-    }
-    console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); no cache — Cloud models unavailable until reconnected. Other providers still work.`);
-    return [];
+    console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); keeping ${cloudDefs.length} previously loaded models.`);
+    return cloudDefs;
   }
 }
+
+// What pi calls. The offline phase re-serves the stored snapshot through the
+// builders (capabilities are re-derived from ids — see deriveCard); the
+// network phase fetches and lets pi persist the result. With no credential at
+// all we return no models, so "Reset all" cannot leave ghosts in pi's store.
+const planRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConfig[]> => {
+  const creds = readAuth()["alibaba-plan"];
+  if (!creds?.access) return [];
+  const ep = resolvePlanEndpoints(creds);
+  const defs = context.allowNetwork
+    ? await loadPlanCatalog(!!context.force)
+    : (planDefs.length ? planDefs : ((context.stored?.models ?? []) as unknown as PlanModelDef[]));
+  return buildPlanModels(defs, ep.openai, ep.anthropic, loadConfig().contextWindowOverrides);
+};
+
+const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConfig[]> => {
+  const cfg = loadConfig();
+  const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
+  const fmt = cfg.cloudApiFormat || "anthropic-messages";
+  const key = readCloudKey();
+  const defs = key
+    ? (context.allowNetwork
+      ? await loadCloudCatalog(domain, key, !!context.force)
+      : (cloudDefs.length ? cloudDefs : ((context.stored?.models ?? []) as unknown as ProviderModelConfig[])))
+    : [];
+  return buildCloudModels(defs.length ? defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+};
 
 // ── Module-level mutable model lists ─────────────────────────────────
-// Populated by the async extension factory before provider registration.
+// Filled by the loaders above (registration baseline + refreshModels), and
+// read by modifyModels, /alibaba's Status/Rate-limits/Override menus.
 let planDefs: PlanModelDef[] = [];
 let cloudDefs: ProviderModelConfig[] = [];
 
@@ -1277,11 +1318,12 @@ export default async function (pi: ExtensionAPI) {
   let cloudDomain = config.cloudDomain || DEFAULT_CLOUD_DOMAIN;
   const cloudFmt: CloudApiFormat = config.cloudApiFormat || "anthropic-messages";
 
-  // Cache-first: pi awaits this factory before it registers providers, so
-  // forcing a live fetch here taxed every launch. session_start uses the
-  // same loaders with force=false; /alibaba → "Refresh model lists" still
-  // calls the fetchers directly.
-  if (planCreds?.access) planDefs = await loadPlanDefs(false, planCreds);
+  // Catalogs before registerProvider(): pi awaits this factory, and
+  // enabledModels validation plus `pi --list-models` want the real catalog
+  // right away. One lightweight catalog GET per launch (never billed);
+  // offline it keeps whatever we hold, and pi's stored snapshot arrives with
+  // the first `refreshModels` phase.
+  if (planCreds?.access) planDefs = await loadPlanCatalog(false);
   if (cloudKey) {
     // One-shot endpoint upgrade: shared regional domain → workspace domain.
     // Pure checks first, so a normal launch pays zero network; on success the
@@ -1295,7 +1337,7 @@ export default async function (pi: ExtensionAPI) {
       );
       cloudDomain = up.domain;
     }
-    cloudDefs = await loadCloudDefs(cloudDomain, cloudKey, false);
+    await loadCloudCatalog(cloudDomain, cloudKey, false);
   }
   // Keep the Cloud provider visible in /login even with no models yet (issue #1).
   if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
@@ -1306,7 +1348,8 @@ export default async function (pi: ExtensionAPI) {
     baseUrl: planEndpoints.anthropic,
     api: "anthropic-messages",
     authHeader: true,
-    models: buildPlanModels(planDefs, planEndpoints.openai, planEndpoints.anthropic),
+    models: buildPlanModels(planDefs, planEndpoints.openai, planEndpoints.anthropic, loadConfig().contextWindowOverrides),
+    refreshModels: planRefreshModels,
     oauth: {
       name: "Alibaba Model Studio Coding Plan",
       async login(callbacks) {
@@ -1355,14 +1398,14 @@ export default async function (pi: ExtensionAPI) {
     apiKey: "$DASHSCOPE_API_KEY",
     api: cloudTransport.api,
     authHeader: true,
-    models: buildCloudModels(cloudDefs, cloudDomain, cloudFmt),
+    models: buildCloudModels(cloudDefs, cloudDomain, cloudFmt, loadConfig().contextWindowOverrides),
+    refreshModels: cloudRefreshModels,
   });
 
   // ── Lazy refresh: fetch live catalogs and re-register ───────────────
   pi.on("session_start", async () => {
    try {
-    const planCred = readAuth()["alibaba-plan"];
-    planDefs = await loadPlanDefs(false, planCred);
+    planDefs = await loadPlanCatalog(false);
 
     const key = readCloudKey();
     if (key) {
@@ -1373,7 +1416,7 @@ export default async function (pi: ExtensionAPI) {
       }
       const cfg = loadConfig();
       const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-      cloudDefs = await loadCloudDefs(domain, key, false);
+      await loadCloudCatalog(domain, key, false);
     }
     // Keep the Cloud provider visible in /login even with no models yet (issue #1).
     if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
@@ -1390,7 +1433,8 @@ export default async function (pi: ExtensionAPI) {
       baseUrl: ep.anthropic,
       api: "anthropic-messages",
       authHeader: true,
-      models: buildPlanModels(planDefs, ep.openai, ep.anthropic),
+      models: buildPlanModels(planDefs, ep.openai, ep.anthropic, loadConfig().contextWindowOverrides),
+      refreshModels: planRefreshModels,
       oauth: {
         name: "Alibaba Model Studio Coding Plan",
         async login(callbacks) {
@@ -1437,7 +1481,8 @@ export default async function (pi: ExtensionAPI) {
       apiKey: "$DASHSCOPE_API_KEY",
       api: cloudTransport.api,
       authHeader: true,
-      models: buildCloudModels(cloudDefs, currentDomain, currentFmt),
+      models: buildCloudModels(cloudDefs, currentDomain, currentFmt, loadConfig().contextWindowOverrides),
+      refreshModels: cloudRefreshModels,
     });
    } catch (e: any) {
     console.warn(`[alibaba] session_start catalog refresh failed (${e?.message || e}); keeping previously loaded models.`);
@@ -1472,15 +1517,9 @@ export default async function (pi: ExtensionAPI) {
 
       if (choice === "Status") {
         const ep = resolvePlanEndpoints(planCred);
-        const planCache = readJSON<PlanCache | null>(PLAN_CACHE_PATH, null);
-        const cloudCache = readJSON<CloudCache | null>(CLOUD_CACHE_PATH, null);
-        const ageMin = (c: { fetchedAt: number } | null) => c ? Math.round((Date.now() - c.fetchedAt) / 60000) : null;
-        const planAge = ageMin(planCache);
-        const cloudAge = ageMin(cloudCache);
-        const isPlanLive = planCache && planAge !== null && planCache.models.length === planDefs.length;
-        const isCloudLive = cloudCache && cloudAge !== null && cloudCache.models.length === cloudDefs.length;
-        const planState = isPlanLive ? `live, ${planAge}m old` : (planDefs.length ? "live, not cached" : "not fetched");
-        const cloudState = isCloudLive ? `live, ${cloudAge}m old` : (cloudDefs.length ? "live, not cached" : "not fetched");
+        const age = (t?: number) => (t ? `${Math.round((Date.now() - t) / 60000)}m old` : "not fetched yet");
+        const planState = planDefs.length ? `fetched ${age(cfg.planFetchedAt)}` : "not fetched";
+        const cloudState = cloudDefs.length ? `fetched ${age(cfg.cloudFetchedAt)}` : "not fetched";
         const lines = [
           `Plan:  ${planCred ? "logged in" : "not logged in"}`,
           `       Anthropic: ${ep.anthropic}`,
@@ -1492,7 +1531,7 @@ export default async function (pi: ExtensionAPI) {
           `       Auto-WS:   ${cfg.cloudAutoWorkspaceDomain === false ? "off" : "on"}${cfg.cloudWorkspaceId ? ` (WorkspaceId ${cfg.cloudWorkspaceId})` : ""}`,
           `       Format:    ${cfg.cloudApiFormat || "anthropic-messages"}`,
           `       Sidecar:   ${cfg.cloudSidecarTools ? `on (${cfg.cloudSidecarModel || "auto Qwen"})` : "off"}`,
-          `       Auth-only: ${cfg.cloudAuthorizedOnly === false ? "off" : "on (when endpoint available)"}${cloudCache?.authorizedOnly ? " — active (filtered list)" : ""}`,
+          `       Auth-only: ${cfg.cloudAuthorizedOnly === false ? "off" : "on (when endpoint available)"}${cfg.cloudAuthorizedFilteredLast ? " — active (filtered list)" : ""}`,
           `       Models:    ${cloudDefs.length} (${cloudState})`,
         ];
         const overrides = cfg.contextWindowOverrides;
@@ -1508,17 +1547,15 @@ export default async function (pi: ExtensionAPI) {
 
       if (choice === "Refresh model lists") {
         try {
-          const planCred = readAuth()["alibaba-plan"];
-          planDefs = await fetchPlanModels(true, planCred);
-          const cloudKey = readCloudKey();
-          let cloudCount = 0;
-          if (cloudKey) {
-            const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-            cloudDefs = await fetchCloudModels(domain, cloudKey, true);
-            cloudCount = cloudDefs.length;
-          }
-          ctx.ui.notify(`Plan: ${planDefs.length} models. Cloud: ${cloudCount > 0 ? `${cloudCount} models` : "skipped (not logged in)"}.`, "info");
-          await ctx.reload();
+          // pi's own refresh path: our `refreshModels` handlers fetch and pi
+          // persists the result (`force` bypasses its freshness checks).
+          const res = await ctx.modelRegistry.refresh({ force: true });
+          const failed = [...res.errors.values()].map((err: any) => err?.message || String(err));
+          ctx.ui.notify(
+            `Plan: ${planDefs.length} models. Cloud: ${cloudDefs.length} models.` +
+              (failed.length ? `\nFailed: ${failed.join("; ")}` : ""),
+            failed.length ? "warning" : "info",
+          );
         } catch (e: any) {
           ctx.ui.notify(`Failed: ${e?.message || e}`, "error");
         }
@@ -1807,9 +1844,10 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Reset all") {
         if (!await ctx.ui.confirm(
           "Reset all Alibaba settings?",
-          "Wipes config, both auth entries, plan-models cache, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
+          "Wipes config, both auth entries, legacy catalog caches, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
         )) return;
-        for (const p of [CONFIG_PATH, PLAN_CACHE_PATH, CLOUD_CACHE_PATH]) { try { fs.unlinkSync(p); } catch {} }
+        try { fs.unlinkSync(CONFIG_PATH); } catch {}
+        removeLegacyCaches();
         // Use authStorage.remove() so pi's in-memory credential cache stays in sync —
         // otherwise /login's "• configured" label persists until pi is restarted.
         const store = authStore(ctx);

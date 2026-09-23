@@ -140,7 +140,7 @@ The plan model list is fetched from the canonical Qwen Code template:
 
 <https://github.com/QwenLM/qwen-code/blob/main/packages/cli/src/constants/codingPlan.ts>
 
-Cached at `~/.pi/agent/alibaba-plan-models.cache.json` for **4 hours**. A fresh cache is the startup fast path (no network on launch). A stale or missing cache, or `/alibaba → Refresh model lists`, fetches live and rewrites the file. On a failed fetch the extension falls back to the last-known-good cache (and, if there's no cache either, registers an empty list rather than crashing).
+Model catalogs are cached by **pi itself** (its provider models store): the extension returns them from `refreshModels`, pi persists the snapshot, restores it offline at startup, and re-fetches on its own freshness schedule. A failed fetch keeps the previous list (and, with none, registers an empty list rather than crashing). `/alibaba → Refresh model lists` forces a refresh through `ctx.modelRegistry.refresh({force: true})`.
 
 The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, text-generation models) and falls back to compatible-mode `/v1/models` on domains that don't expose it. Qwen 3.8 Max, Qwen 3.7 Max/Plus, DeepSeek V4, Kimi, GLM-5, MiniMax etc. all surface automatically as Alibaba ships them.
 
@@ -152,14 +152,15 @@ The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, tex
 - **Responses API**: not every model supports every built-in DashScope tool, and `xhigh`/`max` effort are documented for Beijing/Singapore. If a model errors out, switch back to Chat Completions or Anthropic for that session.
 - **`alibaba_tools`**: Cloud key required (`/login` or `$DASHSCOPE_API_KEY`). Qwen only — 3.7 Max / 3.6 Plus+ search is Responses-only. Completions search does not return source URLs; Responses search/research can. Auto sidecar model prefers Flash/Plus over Max. Search usage is billed on the sidecar call. A silent hang should not happen: the tool card streams elapsed time and built-in calls. Sidecar 429s and transient `server_error` backend failures (`Backend buffer overflow`) retry inside the tool (user sees `429 / server_error, retrying…`; the model only gets the final result). If it still times out, narrow the task or raise `ALIBABA_SIDECAR_TIMEOUT_MS`.
 - **Output budget vs. thinking budget**: On the Anthropic path, `max_tokens` is a **total** budget shared between thinking and the final answer. pi splits the card's `maxTokens` accordingly, so a card value of 8192 leaves only 8192 − 7168 = **1024 tokens** for the actual answer at high thinking — enough to truncate large tool calls (e.g. big `write`/`edit` content) mid-arguments. The card therefore reports the model's own catalog `max_output_tokens` whenever the catalog has a row (clamped at 131072 — e.g. `qwen-plus` = 32768, which yields a 16384-token answer budget at high thinking). Models with **no** catalog row keep a conservative fallback (32768; 8192 for non-reasoning ids and the open-weight `qwen3-<size>b` line, measured at 8192), because overshooting the real ceiling is rejected outright with `Range of max_tokens should be [1, N]`. Completions and Responses keep the catalog's larger output ceilings.
-- **Dynamic Caching**: Model lists are cached for 4 hours. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
+- **Dynamic Caching**: Model lists live in pi's models store (offline snapshot at startup, freshness-gated network refresh). If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
+- **Prompt caching & cache warming**: caching-capable families declare `promptCache: {short: 300}` (DashScope's documented 5-minute ephemeral window, renewed on a hit), which makes them eligible for pi 0.86+'s prompt-cache warming — the global `cacheWarming` setting (`off` / `streaming` / `idle`) decides when warming happens. No `long` tier is declared (none is published). The open-weight `qwen3-<size>b` line has no documented caching and is never warmed. On the Cloud **Responses** format each request additionally carries `x-dashscope-session-cache: enable` — DashScope's server-side session cache gives predictable multi-turn prefix hits (reads billed at ~10% instead of the implicit cache's 20–25%; cache writes at 125%; 5-min window renewed on hit). It is documented for the Responses endpoint only, so Completions/Anthropic requests stay unmarked.
 - **Inferred Context Windows**: Compatible-mode `/v1/models` returns only ids and names, so context windows are inferred from the model id unless native `/api/v1/models` supplied a real value. If a brand-new model shows the wrong size, fix it yourself with `/alibaba → Context Window — Override` (per model, or `*` for all) — no extension update needed.
 
 ## `/alibaba` command reference
 
 | Choice                       | What it does                                                              |
 |------------------------------|---------------------------------------------------------------------------|
-| Status                       | Print Plan/Cloud login state, active endpoints, model count, cache age   |
+| Status                       | Print Plan/Cloud login state, active endpoints, model count, catalog fetch age |
 | Refresh model lists          | Force-refetch Plan + Cloud catalogs and reload the extension             |
 | Re-login Plan                | Wipe `alibaba-plan` from `auth.json` and reload (then run `/login`)      |
 | Re-login Cloud               | Wipe `alibaba-cloud` from `auth.json` and reload (then run `/login`)     |
@@ -200,8 +201,9 @@ All paths live in pi's config directory — `~/.pi/agent` by default, or `$PI_CO
 |-------------------------------------------------------|------------------------------------|
 | `~/.pi/agent/auth.json`                               | Both provider credentials (0600)   |
 | `~/.pi/agent/alibaba-config.json`                     | Endpoint / domain / format config  |
-| `~/.pi/agent/alibaba-plan-models.cache.json`          | 4 h plan-models cache              |
-| `~/.pi/agent/alibaba-cloud-models.cache.v2.json`   | 4 h cloud-models cache             |
+| `~/.pi/agent/alibaba-config.json`                             | endpoints, domain/format, toggles, catalog fetch timestamps |
+
+Model catalogs are **not** written by the extension anymore — pi's provider models store keeps them (restored offline at startup).
 
 ## From the same author
 
