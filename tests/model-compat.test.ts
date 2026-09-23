@@ -10,6 +10,7 @@ import {
   isReasoningModel,
   isVisionModel,
   parseApiV1Prices,
+  parseCatalogCache,
   resolveCloudApi,
   supportsCloudResponses,
   thinkingConfigFor,
@@ -371,6 +372,18 @@ describe("catalog fetch freshness gate (many pi instances, one agent dir)", () =
     assert.equal(catalogFresh(NOW - WINDOW_MS, NOW), false);
     assert.equal(catalogFresh(undefined, NOW), false);
     assert.equal(catalogFresh(NaN, NOW), false);
+  });
+});
+
+describe("private catalog snapshot (plan C: independent of pi's store)", () => {
+  it("accepts only the current snapshot version", () => {
+    // The 1.4.5 lesson, enforced in code: an old or foreign format must never
+    // pose as catalog data.
+    assert.equal(parseCatalogCache(null), null);
+    assert.equal(parseCatalogCache("nope"), null);
+    assert.equal(parseCatalogCache({ v: 1, cloud: { fetchedAt: 1, models: [{ id: "x" }] } }), null);
+    const ok = { v: 2 as const, cloud: { fetchedAt: 1, models: [] } };
+    assert.deepEqual(parseCatalogCache(ok), ok);
   });
 });
 

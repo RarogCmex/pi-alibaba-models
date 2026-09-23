@@ -24,6 +24,10 @@ import {
 const HOME_DIR = getAgentDir();
 const CONFIG_PATH = path.join(HOME_DIR, "alibaba-config.json");
 const AUTH_PATH = path.join(HOME_DIR, "auth.json");
+// Private, versioned catalog snapshot (the "plan C" hybrid): it fills provider
+// registration at boot with zero network and keeps the extension independent
+// of pi's models-store semantics. pi's store stays as a bonus channel.
+const CATALOG_CACHE_PATH = path.join(HOME_DIR, "alibaba-models.cache.json");
 // Model catalogs live in pi's own models store: `refreshModels` returns them,
 // pi persists the snapshot and hands it back as `context.stored` for
 // offline/cache-only initialization. The extension's own cache files are gone
@@ -140,7 +144,11 @@ const readJSON = <T>(p: string, fallback: T): T => {
 };
 const writeJSON = (p: string, data: unknown) => {
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(data, null, 2), { mode: 0o600 });
+  // Atomic replace: 30 pi instances share these files and a torn JSON would
+  // break everyone. Write a private tmp file, then rename over the target.
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, p);
 };
 const loadConfig = (): AlibabaConfig => readJSON<AlibabaConfig>(CONFIG_PATH, {});
 const saveConfig = (c: AlibabaConfig) => writeJSON(CONFIG_PATH, c);
@@ -1183,6 +1191,39 @@ async function acquireCatalogLock(waitMs = 0): Promise<boolean> {
 }
 const releaseCatalogLock = () => { try { fs.unlinkSync(CATALOG_LOCK_PATH); } catch {} };
 
+// The private snapshot is written ONLY after a real fetch (atomic writeJSON)
+// and read as a plain boot seed — never as proof of freshness: the shared
+// timestamp in alibaba-config.json remains the only freshness/coordination
+// signal, and the lockfile the only writer serializer.
+interface CatalogCache {
+  v: 2;
+  plan?: { fetchedAt: number; models: PlanModelDef[] };
+  cloud?: { fetchedAt: number; models: ProviderModelConfig[] };
+}
+
+// Pure parser and version guard in one: anything but v2 is ignored, so an old
+// or foreign format can never pose as catalog data.
+export function parseCatalogCache(raw: unknown): CatalogCache | null {
+  if (!raw || typeof raw !== "object") return null;
+  const c = raw as CatalogCache;
+  return c.v === 2 ? c : null;
+}
+const readCatalogCache = (): CatalogCache | null =>
+  parseCatalogCache(readJSON<unknown>(CATALOG_CACHE_PATH, null));
+function updateCatalogCache(patch: Partial<CatalogCache>) {
+  const current = readCatalogCache() ?? { v: 2 };
+  writeJSON(CATALOG_CACHE_PATH, { ...current, ...patch, v: 2 });
+}
+
+// Boot seed: registration gets the snapshot immediately (zero network, so
+// `pi --list-models` and enabledModels validation see real ids), while the
+// timestamp still governs freshness and the lock still governs fetches.
+function seedFromSnapshot() {
+  const cache = readCatalogCache();
+  if (cache?.plan?.models?.length) planDefs = cache.plan.models;
+  if (cache?.cloud?.models?.length) cloudDefs = cache.cloud.models;
+}
+
 type CatalogResult<T> = { defs: T[]; fetched: boolean }; 
 
 // Best-effort fetch under the cross-instance lock: a failure keeps whatever we
@@ -1197,6 +1238,7 @@ async function loadPlanCatalog(force: boolean): Promise<CatalogResult<PlanModelD
     planDefs = defs;
     cfg.planFetchedAt = Date.now();
     saveConfig(cfg);
+    updateCatalogCache({ plan: { fetchedAt: cfg.planFetchedAt, models: defs } });
     return { defs, fetched: true };
   } catch (e: any) {
     console.warn(`[alibaba] Plan catalog fetch failed (${e?.message || e}); keeping ${planDefs.length} previously loaded models.`);
@@ -1217,6 +1259,7 @@ async function loadCloudCatalog(domain: string, apiKey: string, force: boolean):
     cfg.cloudFetchedAt = Date.now();
     cfg.cloudAuthorizedFilteredLast = authorizedOnly;
     saveConfig(cfg);
+    if (models.length) updateCatalogCache({ cloud: { fetchedAt: cfg.cloudFetchedAt, models } });
     return { defs, fetched: models.length > 0 };
   } catch (e: any) {
     console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); keeping ${cloudDefs.length} previously loaded models.`);
@@ -1457,6 +1500,7 @@ export default async function (pi: ExtensionAPI) {
   // registration falls back to the login seed so it stays visible in /login
   // with no catalog yet (issue #1).
   if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
+  seedFromSnapshot();
   registerPlanProvider(pi);
   registerCloudProvider(pi);
 
@@ -1839,6 +1883,7 @@ export default async function (pi: ExtensionAPI) {
           "Wipes config, both auth entries, legacy catalog caches, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
         )) return;
         try { fs.unlinkSync(CONFIG_PATH); } catch {}
+        try { fs.unlinkSync(CATALOG_CACHE_PATH); } catch {}
         removeLegacyCaches();
         // Use authStorage.remove() so pi's in-memory credential cache stays in sync —
         // otherwise /login's "• configured" label persists until pi is restarted.

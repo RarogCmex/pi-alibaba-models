@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.7
+
+The "plan C" hybrid for model catalogs: independence from pi's store semantics.
+
+- **Private, versioned catalog snapshot.** `alibaba-models.cache.json` (`{v: 2, plan?, cloud?}`) is written only after a real fetch and seeds provider registration at boot with **zero network** — `pi --list-models` and `enabledModels` validation see real ids immediately. It is a seed, never proof of freshness: the shared 10-minute timestamp remains the only freshness signal and the lockfile the only writer serializer. Anything but v2 is ignored in code (the 1.4.5 "old cache rows pose as catalog data" lesson, now enforced by `parseCatalogCache`).
+- **pi's models store is a bonus channel, not a dependency.** `refreshModels` still serves and publishes there, but a pi contract change can no longer leave us without models — the1.4.6 investigation showed the legacy `ProviderConfig` form does not persist returns at all.
+- **All JSON writes are atomic** (tmp + rename): config, auth and caches — one torn write can no longer break 30 pi instances sharing the agent dir.
+
 ## 1.4.6
 
 Caching and cache warming move onto pi 0.86+ built-ins.
