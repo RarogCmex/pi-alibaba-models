@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.0
+
+**The default Cloud wire format is now `openai-responses`** — a deliberate MINOR bump: the API surface is unchanged and per-model fallbacks remain, but what you get out of the box changes.
+
+- **Responses by default.** Session-cache economics (predictable multi-turn prefix hits: reads ~10% vs the implicit cache's 20–25%), agent-native features (built-in DashScope tools with source URLs, `previous_response_id`), and none of the Anthropic path's `max_tokens = thinking + answer` budget squeeze. The `supportsCloudResponses` gate keeps models without Responses support (kimi-k2.x, MiniMax-M2.5, glm-5.1/5, glm-4.5, qwen-max) on Chat Completions automatically.
+- **The resolved format is pinned into `alibaba-config.json` at first boot.** An unset format used to mean `anthropic-messages`; silently flipping wire protocols under existing installs is exactly what tickets are made of. If you explicitly chose a format, nothing changes for you.
+- **`cloudSessionCache` toggle** (`/alibaba → Cloud — Session Cache: On / Off`, default on): session-cache writes are billed at 125% of input and re-reads at ~10% — a net win for multi-turn agent sessions, a small premium for one-shot `pi -p` usage. Turn it off if your usage is one-shot-heavy.
+- **Status shows what the format hides**: `Format: openai-responses (N model(s) fall back to Chat Completions)` plus the session-cache state.
+- The default lives in one place now (`DEFAULT_CLOUD_FORMAT`); the format picker recommends Responses. Plan stays on its Anthropic/OpenAI-compatible endpoints as before.
+
 ## 1.4.7
 
 The "plan C" hybrid for model catalogs: independence from pi's store semantics.

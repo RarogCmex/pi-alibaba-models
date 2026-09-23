@@ -5,6 +5,7 @@ import {
   buildCloudModels,
   buildPlanModels,
   catalogFresh,
+  countFallbackModels,
   formatQuota,
   inferAnthropicMaxTokens,
   isReasoningModel,
@@ -437,5 +438,39 @@ describe("native catalog helpers", () => {
       }),
       "10 req/s; 1,000,000 tokens/per-60s; workspace-limit set",
     );
+  });
+});
+
+describe("1.5.0: Responses is the default Cloud format", () => {
+  const def = (id: string) => ({
+    id,
+    name: id,
+    description: "",
+    contextWindow: 0,
+    maxTokens: 0,
+    input: ["text"],
+  }) as any;
+
+  it("buildCloudModels defaults to openai-responses with the session-cache header", () => {
+    const [card] = buildCloudModels([def("qwen3.7-plus")], "dashscope-intl.aliyuncs.com", "");
+    assert.equal(card.api, "openai-responses");
+    assert.deepEqual(card.headers, { "x-dashscope-session-cache": "enable" });
+  });
+
+  it("cloudSessionCache=false strips the header (one-shot-heavy usage)", () => {
+    const [card] = buildCloudModels([def("qwen3.7-plus")], "dashscope-intl.aliyuncs.com", "", undefined, false);
+    assert.equal(card.headers, undefined);
+  });
+
+  it("session cache stays off non-Responses routes", () => {
+    const [card] = buildCloudModels([def("kimi-k2.6")], "dashscope-intl.aliyuncs.com", "openai-responses");
+    assert.equal(card.api, "openai-completions"); // no Responses support -> fallback
+    assert.equal(card.headers, undefined);
+  });
+
+  it("countFallbackModels surfaces silent per-model fallbacks", () => {
+    assert.equal(countFallbackModels([def("qwen3.7-plus"), def("kimi-k2.6")], "openai-responses"), 1);
+    assert.equal(countFallbackModels([def("qwen3.7-plus"), def("kimi-k2.6")], "openai-completions"), 0);
+    assert.equal(countFallbackModels([def("deepseek-v4-pro")], "anthropic-messages"), 1);
   });
 });

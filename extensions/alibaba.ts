@@ -84,6 +84,11 @@ const ANTHROPIC_ALL_LEVELS = levels({
 const DEFAULT_PLAN_OPENAI = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_PLAN_ANTHROPIC = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
 const DEFAULT_CLOUD_DOMAIN = "dashscope-intl.aliyuncs.com";
+// Since 1.5.0 Responses is the default Cloud wire format (session-cache
+// economics, agent-native features, no Anthropic budget squeeze). An unset
+// cloudApiFormat is pinned to this at registration so an install keeps one
+// stable, explicit choice instead of silently following future default flips.
+const DEFAULT_CLOUD_FORMAT: CloudApiFormat = "openai-responses";
 const DEFAULT_CLOUD_US_DOMAIN = "dashscope-us.aliyuncs.com";
 const DEFAULT_CLOUD_CN_DOMAIN = "dashscope.aliyuncs.com";
 const DEFAULT_CLOUD_HK_DOMAIN = "cn-hongkong.dashscope.aliyuncs.com";
@@ -105,6 +110,11 @@ interface AlibabaConfig {
   planAnthropic?: string;
   cloudDomain?: string;
   cloudApiFormat?: CloudApiFormat;
+  // Session-cache header for Cloud Responses requests (x-dashscope-session-
+  // cache). Default on: writes are billed at 125% of input and re-reads at
+  // ~10%, so multi-turn agent sessions win big while one-shot prompts pay a
+  // small premium. Set false for one-shot-heavy usage.
+  cloudSessionCache?: boolean;
   // Override the context-window shown on a model's card in the picker.
   // Keyed by exact model id (e.g. "qwen3.7-plus"); the special key "*" applies
   // to every model that has no explicit entry. Values are token counts.
@@ -853,13 +863,21 @@ function cloudDefaultTransport(domain: string, fmt: CloudApiFormat): { api: Clou
   };
 }
 
+// How many registered Cloud models would NOT ride the selected wire format.
+// Surfaced in /alibaba → Status: with Responses as the default, silent
+// per-model fallbacks to Chat Completions are otherwise invisible. Pure.
+export function countFallbackModels(models: { id: string }[], fmt: CloudApiFormat): number {
+  return models.filter((m) => resolveCloudApi(m.id, fmt) !== fmt).length;
+}
+
 export function buildCloudModels(
   models: ProviderModelConfig[],
   domain: string,
   fmt: string,
   overrides?: Record<string, number>,
+  sessionCache = true,
 ): ProviderModelConfig[] {
-  const format = (fmt as CloudApiFormat) || "anthropic-messages";
+  const format = (fmt as CloudApiFormat) || DEFAULT_CLOUD_FORMAT;
   return models.map((m) => {
     const api = resolveCloudApi(m.id, format);
     const tc = thinkingConfigFor(m.id, api);
@@ -874,8 +892,10 @@ export function buildCloudModels(
       // DashScope's session cache makes multi-turn prefix hits predictable on
       // Responses (5-min window renewed on hit, reads billed at ~10% instead
       // of the implicit cache's indeterminate TTL and 20–25% reads) and is
-      // opt-in per request. Models re-routed to Completions stay unmarked.
-      headers: api === "openai-responses" ? { "x-dashscope-session-cache": "enable" } : undefined,
+      // opt-in per request. Models re-routed to Completions stay unmarked, and
+      // cloudSessionCache=false strips the header entirely (one-shot-heavy
+      // usage: cache writes cost 125% of input and may never be re-read).
+      headers: api === "openai-responses" && sessionCache ? { "x-dashscope-session-cache": "enable" } : undefined,
       baseUrl: openai ? `https://${domain}/compatible-mode/v1` : `https://${domain}/apps/anthropic`,
       api,
     };
@@ -1301,20 +1321,20 @@ const planRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConf
 const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConfig[]> => {
   const cfg = loadConfig();
   const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-  const fmt = cfg.cloudApiFormat || "anthropic-messages";
+  const fmt = cfg.cloudApiFormat || DEFAULT_CLOUD_FORMAT;
   const key = readCloudKey();
   // The login seed must never shadow pi's stored snapshot in the cache-only
   // phase; with no credential nothing is served at all ("Reset all" safety).
   const held = cloudDefs.length && cloudDefs !== CLOUD_LOGIN_SEED
     ? cloudDefs
     : ((context.stored?.models ?? []) as unknown as ProviderModelConfig[]);
-  if (!key) return buildCloudModels(CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+  if (!key) return buildCloudModels(CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
   if (!context.allowNetwork) {
     if (!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) cloudDefs = held;
-    return buildCloudModels(held.length ? held : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+    return buildCloudModels(held.length ? held : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
   }
   const result = await loadCloudCatalog(domain, key, !!context.force);
-  const built = buildCloudModels(result.defs.length ? result.defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
+  const built = buildCloudModels(result.defs.length ? result.defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
   // One store write per real fetch (see planRefreshModels), with the same
   // catch-up when the bonus channel is empty.
   if (result.defs.length && result.defs !== CLOUD_LOGIN_SEED && (result.fetched || !context.stored?.models?.length)) {
@@ -1463,7 +1483,15 @@ function registerPlanProvider(pi: ExtensionAPI) {
 function registerCloudProvider(pi: ExtensionAPI) {
   const cfg = loadConfig();
   const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-  const fmt: CloudApiFormat = cfg.cloudApiFormat || "anthropic-messages";
+  // 1.5.0: Responses is the new default, and the resolved default is pinned
+  // here at registration. An unset format used to mean anthropic-messages;
+  // silently flipping wire protocols under existing installs is exactly what
+  // tickets are made of. Anyone who explicitly picked a format keeps it.
+  if (!cfg.cloudApiFormat) {
+    cfg.cloudApiFormat = DEFAULT_CLOUD_FORMAT;
+    saveConfig(cfg);
+  }
+  const fmt: CloudApiFormat = cfg.cloudApiFormat;
   const transport = cloudDefaultTransport(domain, fmt);
   // ── Cloud provider ─────────────────────────────────────────────────
     pi.registerProvider("alibaba-cloud", {
@@ -1472,7 +1500,7 @@ function registerCloudProvider(pi: ExtensionAPI) {
     apiKey: "$DASHSCOPE_API_KEY",
     api: transport.api,
     authHeader: true,
-    models: buildCloudModels(cloudDefs, domain, fmt, cfg.contextWindowOverrides),
+    models: buildCloudModels(cloudDefs, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false),
     refreshModels: cloudRefreshModels,
   });
 }
@@ -1551,6 +1579,7 @@ export default async function (pi: ExtensionAPI) {
         "Cloud — Change Domain",
         "Cloud — Auto workspace domain",
         "Cloud — Change API Format",
+        "Cloud — Session Cache: On / Off",
         "Cloud — DashScope built-in tools",
         "Rate limits (Cloud)",
         "Cloud — Authorized-only Filter",
@@ -1569,6 +1598,8 @@ export default async function (pi: ExtensionAPI) {
         const age = (t?: number) => (t ? `${Math.round((Date.now() - t) / 60000)}m old` : "not fetched yet");
         const planState = planDefs.length ? `fetched ${age(cfg.planFetchedAt)}` : "not fetched";
         const cloudState = cloudDefs.length ? `fetched ${age(cfg.cloudFetchedAt)}` : "not fetched";
+        const cloudFmt = (cfg.cloudApiFormat || DEFAULT_CLOUD_FORMAT) as CloudApiFormat;
+        const fallbacks = countFallbackModels(cloudDefs, cloudFmt);
         const lines = [
           `Plan:  ${planCred ? "logged in" : "not logged in"}`,
           `       Anthropic: ${ep.anthropic}`,
@@ -1578,7 +1609,8 @@ export default async function (pi: ExtensionAPI) {
           `Cloud: ${cloudCred ? "logged in" : (process.env.DASHSCOPE_API_KEY ? "via $DASHSCOPE_API_KEY" : "not logged in")}`,
           `       Domain:    ${cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN}`,
           `       Auto-WS:   ${cfg.cloudAutoWorkspaceDomain === false ? "off" : "on"}${cfg.cloudWorkspaceId ? ` (WorkspaceId ${cfg.cloudWorkspaceId})` : ""}`,
-          `       Format:    ${cfg.cloudApiFormat || "anthropic-messages"}`,
+          `       Format:    ${cloudFmt}${fallbacks ? ` (${fallbacks} model${fallbacks === 1 ? "" : "s"} fall back to Chat Completions)` : ""}`,
+          `       Sess.cache: ${cfg.cloudSessionCache === false ? "off" : "on (Responses header)"}`,
           `       Sidecar:   ${cfg.cloudSidecarTools ? `on (${cfg.cloudSidecarModel || "auto Qwen"})` : "off"}`,
           `       Auth-only: ${cfg.cloudAuthorizedOnly === false ? "off" : "on (when endpoint available)"}${cfg.cloudAuthorizedFilteredLast ? " — active (filtered list)" : ""}`,
           `       Models:    ${cloudDefs.length} (${cloudState})`,
@@ -1751,9 +1783,9 @@ export default async function (pi: ExtensionAPI) {
 
       if (choice === "Cloud — Change API Format") {
         const sel = await ctx.ui.select("Cloud API format:", [
-          "Anthropic Messages (recommended)",
+          "OpenAI Responses (recommended)",
+          "Anthropic Messages",
           "OpenAI Chat Completions",
-          "OpenAI Responses",
         ]);
         if (!sel) return;
         cfg.cloudApiFormat = sel.startsWith("Anthropic")
@@ -1763,6 +1795,20 @@ export default async function (pi: ExtensionAPI) {
             : "openai-completions";
         saveConfig(cfg);
         ctx.ui.notify(`Cloud format: ${cfg.cloudApiFormat}`, "info");
+        await ctx.reload();
+        return;
+      }
+
+      if (choice === "Cloud — Session Cache: On / Off") {
+        const on = cfg.cloudSessionCache !== false;
+        cfg.cloudSessionCache = !on;
+        saveConfig(cfg);
+        ctx.ui.notify(
+          `Session cache (x-dashscope-session-cache, Responses format): ${on ? "off" : "on"}.\n` +
+          `Writes are billed at 125% of input and re-read at ~10%: keep it on for multi-turn\n` +
+          `agent sessions (net win), off if pi is mostly one-shot prompts.`,
+          "info",
+        );
         await ctx.reload();
         return;
       }
