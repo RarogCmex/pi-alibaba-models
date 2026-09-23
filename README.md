@@ -54,7 +54,8 @@ After install, restart `pi`. The extension registers two providers and a slash c
 If you've already run `pi remove` and want to clean leftovers manually:
 
 ```bash
-rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-plan-models.cache.json ~/.pi/agent/alibaba-cloud-models.cache*.json
+rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-models.cache.json ~/.pi/agent/alibaba-catalog.lock* \
+      ~/.pi/agent/alibaba-plan-models.cache.json ~/.pi/agent/alibaba-cloud-models.cache*.json  # 1.4.x leftovers
 # then edit ~/.pi/agent/auth.json and remove the "alibaba-plan" / "alibaba-cloud" entries
 # then edit ~/.pi/agent/settings.json and drop any "alibaba-*/..." or "dashscope/..." entries from enabledModels
 ```
@@ -204,7 +205,7 @@ All paths live in pi's config directory — `~/.pi/agent` by default, or `$PI_CO
 | `~/.pi/agent/alibaba-config.json`                             | endpoints, domain/format, toggles, catalog fetch timestamps |
 | `~/.pi/agent/alibaba-models.cache.json`                     | versioned catalog snapshot (boot seed, written after fetches) |
 
-Model catalogs live in **two places on purpose** (the "plan C" hybrid): pi's provider models store (`models-store.json`) is a bonus channel, while a private versioned snapshot `alibaba-models.cache.json` — written only after a real fetch — seeds provider registration at boot with **zero network** and keeps the extension independent of pi's store semantics. `alibaba-catalog.lock` is a transient fetch lock. Every JSON write is atomic (tmp + rename), so parallel instances can never observe a torn file.
+Model catalogs live in **two places on purpose** (the "plan C" hybrid): pi's provider models store (`models-store.json`) is a bonus channel, while a private versioned snapshot `alibaba-models.cache.json` — written only after a real fetch — seeds provider registration at boot with **zero network** and keeps the extension independent of pi's store semantics. `alibaba-catalog.lock` is a transient fetch lock. Every JSON write is atomic (tmp + rename), so parallel instances can never observe a torn file. Uninstalling removes only our files — `models-store.json` belongs to pi and is shared with other providers, so delete our rows there only if you also want the cached catalogs gone.
 
 ## From the same author
 
