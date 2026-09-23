@@ -25,17 +25,20 @@ const HOME_DIR = getAgentDir();
 const CONFIG_PATH = path.join(HOME_DIR, "alibaba-config.json");
 const AUTH_PATH = path.join(HOME_DIR, "auth.json");
 const PLAN_CACHE_PATH = path.join(HOME_DIR, "alibaba-plan-models.cache.json");
-const CLOUD_CACHE_PATH = path.join(HOME_DIR, "alibaba-cloud-models.cache.json");
+// v2 filename: rows now store the catalog's `max_output_tokens` or 0. Caches
+// written before 1.4.5 stored id-based guesses there, which would otherwise
+// masquerade as catalog rows after the upgrade.
+const CLOUD_CACHE_PATH = path.join(HOME_DIR, "alibaba-cloud-models.cache.v2.json");
 
 const MODELS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 
 // ── Thinking levels (measured against the live endpoint) ─────────────
 //
-// pi reads `thinkingLevelMap` as a tristate: a string is sent to the provider,
-// `null` hides the level, and an omitted key falls back to pi's default
-// (extended xhigh/max stay unsupported when omitted). Duplicate strings are
-// fine — pi clamps upward first, so `medium: "high"` makes picking Medium
-// send `high` rather than reject.
+// pi reads `thinkingLevelMap` as a tristate (verified against pi 0.87's
+// clampThinkingLevel/getSupportedThinkingLevels): a string is the effort sent
+// to the provider, `null` hides the level, and a request for a hidden level is
+// routed to the nearest supported one (upward first). `xhigh`/`max` are only
+// offered when they carry an explicit key.
 //
 // Everything below was probed against the workspace endpoint on 2026-09-22:
 //   • the Anthropic path splits `maxTokens` into a thinking budget plus the
@@ -49,19 +52,25 @@ const MODELS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 // the field, so kimi must not be flagged as reasoning at all (see
 // Fornace/pi-alibaba-models#9).
 //
-// `off` must be a *string*, not `null`: pi clamps an unsupported level upward,
-// so `off: null` would silently turn "off" into a real thinking budget instead
-// of sending `thinking: {type: "disabled"}`. The mapped value itself is unused
-// on this path — pi only checks that it is not null.
-const ANTHROPIC_ALL_LEVELS: Record<string, string | null> = {
-  off: "off",
-  minimal: "minimal",
-  low: "low",
-  medium: "medium",
-  high: "high",
-  xhigh: "xhigh",
-  max: "max",
-};
+// `off` must be a *string*, not `null`: pi serializes `--thinking off` as
+// `thinking: {type: "disabled"}` only when `thinkingLevelMap.off` is non-null
+// (anthropic-messages path); with `null` the level is unsupported and pi
+// clamps "off" up to a real thinking level. The `off` string itself is never
+// sent — pi derives the thinking budget from the selected level's name.
+
+type Level = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+type Levels = Record<string, string | null>;
+const LEVELS: Level[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+// A level map listing only the literals a family really accepts; anything
+// else is `null`, so pi hides it and routes a request for it to the nearest
+// accepted level. Explicit strings express a documented coercion instead.
+const levels = (accepted: Partial<Record<Level, string>>): Levels =>
+  Object.fromEntries(LEVELS.map((l) => [l, accepted[l] ?? null])) as Levels;
+
+const ANTHROPIC_ALL_LEVELS = levels({
+  off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+});
 
 const DEFAULT_PLAN_OPENAI = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
 const DEFAULT_PLAN_ANTHROPIC = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
@@ -157,8 +166,12 @@ function authStore(ctx: ExtensionCommandContext): AuthStorageLike {
 // ── Plan model definitions ────────────────────────────────────────────
 // Anthropic-compatible by default; deepseek forced to openai-completions.
 interface PlanModelDef {
-  id: string; name: string; reasoning: boolean; contextWindow: number; maxTokens: number;
+  id: string; name: string; reasoning: boolean; contextWindow: number;
   input: ("text" | "image")[]; compat?: { thinkingFormat: "qwen" }; openaiOnly?: boolean;
+  // A real `max_output_tokens` if a Plan source ever reports one — none does
+  // today (bare ids from /compatible-mode/v1/models), so resolveMaxTokens()
+  // falls back to the conservative pair for these models.
+  catalogMaxTokens?: number;
 }
 
 // ── Plan model fetch + parse + cache ──────────────────────────────────
@@ -172,17 +185,23 @@ interface PlanCache { fetchedAt: number; source: string; models: PlanModelDef[];
 export const isVisionModel = (id: string): boolean =>
   /vl|vision/i.test(id) || /^qwen3\.\d+-plus\b/i.test(id) || /^qwen3\.8\b/i.test(id) || /kimi/i.test(id);
 
-// Whether a model accepts thinking controls at all. This deliberately follows
-// the naming heuristics below rather than the catalog's `Reasoning` tag: the
-// /api/v1/models tag is unreliable in both directions (it marks `qwen-turbo`
-// as reasoning even though the id accepts no thinking controls, and lists
-// plain `qwen3-30b-a3b` without the tag although it answers with reasoning).
-// The Anthropic path is lenient — every family except Kimi accepts
-// `thinking_budget` — so a miss here only costs the thinking picker.
+// Whether a model accepts thinking controls at all. Named families answer
+// through their capability row (the single source of truth); exotic ids fall
+// back to the naming heuristic. The catalog's `Reasoning` tag is deliberately
+// ignored — the /api/v1/models tag is unreliable in both directions (it marks
+// `qwen-turbo` as reasoning even though the id accepts no thinking controls,
+// and lists plain `qwen3-30b-a3b` without the tag although it answers with
+// reasoning), so callers must never OR it back in. Roleplay `-character`
+// variants of any family take no thinking controls. The Anthropic path is
+// lenient — every family except Kimi accepts `thinking_budget` — so a miss
+// here only costs the thinking picker.
+const REASONING_HEURISTIC =
+  /qwq|max|thinking|deepseek|minimax|glm|stepfun|unisound|^qwen3-\d|^qwen-(plus|flash)(-|$)|3\.[5-9]/i;
+
 export const isReasoningModel = (id: string): boolean =>
   !/^kimi/i.test(id) &&
-  /qwq|max|thinking|deepseek|minimax|glm|stepfun|unisound|^qwen3-\d|^qwen-(plus|flash)(-|$)|3\.[5-9]/i.test(id) &&
-  !/^qwen-(plus|flash)-character/i.test(id);
+  !/-character/i.test(id) &&
+  (capsFor(id).reasoning ?? REASONING_HEURISTIC.test(id));
 
 // Infer context window (tokens) from model id. Sources:
 // https://www.alibabacloud.com/help/en/model-studio/models
@@ -222,6 +241,9 @@ export const inferAnthropicMaxTokens = (id: string, catalogMax?: number): number
   if (typeof catalogMax === "number" && Number.isFinite(catalogMax) && catalogMax > 0) {
     return Math.min(catalogMax, ANTHROPIC_MAX_TOKENS);
   }
+  // No catalog row: stay under every ceiling we know of. The open-weight
+  // qwen3-<size>b line is measured at 8192 (qwen3-30b-a3b rejects more).
+  if (/^qwen3-\d+b(-|$)/i.test(id)) return 8192;
   return isReasoningModel(id) ? 32768 : 8192;
 };
 
@@ -242,9 +264,47 @@ export const inferOpenAIMaxTokens = (id: string): number => {
   return 16384;
 };
 
-// Chat Completions (`reasoning_effort`) maps. Measured 2026-09-22 with a
-// *per-model* `max_completion_tokens` — probing with a budget above a model's
-// own ceiling returns `Range of max_tokens…` and looks like a rejected effort.
+// The one place a card's `maxTokens` is decided — shared by the Plan and
+// Cloud builders so they cannot drift apart (they used to be twins and did).
+// `catalogMax` is a *real* `max_output_tokens` from the catalog, or 0/
+// undefined when the catalog has no row for the model: a guessed ceiling is
+// never passed in as one, because DashScope rejects overshoots outright with
+// `Range of max_tokens should be [1, N]`. Plan defs carry no catalog rows
+// today, so they take the conservative fallback below.
+export function resolveMaxTokens(id: string, api: string, catalogMax?: number): number {
+  const catalog = typeof catalogMax === "number" && Number.isFinite(catalogMax) && catalogMax > 0
+    ? catalogMax
+    : undefined;
+  return api === "anthropic-messages"
+    ? inferAnthropicMaxTokens(id, catalog)
+    : (catalog ?? inferOpenAIMaxTokens(id));
+}
+
+// Also shared by both builders: compatible-mode rejects the `developer` role
+// (`developer is not one of ['system', ...]`) and has no `store` field, so
+// both are forced off there and left untouched on the Anthropic path.
+function mergeCompat(
+  base: object | undefined,
+  tc: ThinkingConfig | undefined,
+  openai: boolean,
+): ProviderModelConfig["compat"] {
+  return openai
+    ? {
+        ...(base ?? {}),
+        ...(tc?.compat ?? {}),
+        supportsDeveloperRole: false,
+        supportsStore: false,
+      } as ProviderModelConfig["compat"]
+    : ((tc?.compat ?? base) as ProviderModelConfig["compat"]);
+}
+
+// ── Per-family capability table ──────────────────────────────────────
+// Chat Completions (`reasoning_effort`, plus `enable_thinking` on the `qwen`
+// thinking format) and Responses (`reasoning.effort`) accept a different
+// subset per family. Measured 2026-09-22 with a *per-model*
+// `max_completion_tokens` — probing with a budget above a model's own ceiling
+// returns `Range of max_tokens…` and looks like a rejected effort. Accepted
+// literals per family ("none" = thinking can be switched off):
 //
 //   qwen3.8                    none minimal low medium high xhigh max
 //   qwen3.7/3.6/3.5            none minimal low medium high xhigh
@@ -255,56 +315,91 @@ export const inferOpenAIMaxTokens = (id: string): number => {
 //   glm-5.2 / glm-4.x          none minimal low medium high xhigh max
 //   glm-5.1 / glm-5            none minimal low medium high xhigh
 //   deepseek-v4-pro/flash                 low medium high xhigh max
-//   deepseek-v4.1-flash/0813/0731 none minimal low medium high xhigh max
+//   deepseek-v4.1-*           none minimal low medium high xhigh max
 //   kimi-k3                    none minimal low medium high xhigh max
 //   kimi-k2.5/2.6/2.7          none minimal low medium high xhigh
 //   MiniMax-M2.5                          low medium high xhigh
 //   MiniMax-M2.1               none minimal low medium high xhigh max
 //
-// `off: null` means the family rejects `enable_thinking: false`; pi then omits
-// both fields and DashScope runs the model's own default (thinking on).
-const COMPLETIONS_UNIVERSAL: Record<string, string | null> = {
-  off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
-};
-const COMPLETIONS_NO_MAX: Record<string, string | null> = {
-  off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null,
-};
-const COMPLETIONS_ALWAYS_ON: Record<string, string | null> = {
-  off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
-};
-const COMPLETIONS_GLM_DEEPSEEK: Record<string, string | null> = {
-  off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max",
-};
-// GLM-5.3 and MiniMax-M2.5 only accept a narrow set; the levels they reject
-// are first clamped by pi, then sent as the documented value.
-const COMPLETIONS_GLM53: Record<string, string | null> = {
-  off: null, minimal: null, low: "low", medium: "high", high: "high", xhigh: null, max: "max",
-};
-const COMPLETIONS_MINIMAX25: Record<string, string | null> = {
-  off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null,
-};
-const COMPLETIONS_MINIMAX21: Record<string, string | null> = {
-  off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
-};
+// "Accepted" is not "distinct": the docs document the coercions explicitly
+// for some families (deepseek-v4-pro/flash: low/medium → high, xhigh → max;
+// deepseek-v4.1: minimal → low, medium/xhigh → high; glm-5.3: medium → high,
+// xhigh → max — help.aliyun.com/…/deepseek-api, …/glm). Where they do, the
+// map lists only the distinct literals and hides the coerced ones, so pi's
+// own clamp routes a request to exactly the documented effort.
+//
+// `off` is a separate mechanism per path. Completions: pi sends
+// `enable_thinking: false` (the map's `off` value is never sent), and
+// `off: null` hides the level for families that reject the field — MiniMax,
+// which switches thinking through `thinking.type: "adaptive" | "disabled"`,
+// a parameter pi's OpenAI paths never emit. Responses: pi sends
+// `reasoning: {effort: <off value>}`, so `off` is the literal `"none"`
+// wherever thinking can be disabled at all.
+const L_ALL = levels({ off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+const L_NO_MAX = levels({ off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh" });
+const L_ALWAYS_ON = levels({ minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+const L_DEEPSEEK_V4 = levels({ high: "high", max: "max" });
+const L_DEEPSEEK_V41 = levels({ off: "none", low: "low", high: "high", max: "max" });
+const L_GLM53 = levels({ low: "low", high: "high", max: "max" });
+const L_MINIMAX25 = levels({ low: "low", medium: "medium", high: "high", xhigh: "xhigh" });
+const L_MEDIUM_CEILING = levels({ off: "none", minimal: "minimal", low: "low", medium: "medium" });
+const L_NONE_ONLY = levels({ off: "none" });
 
-// Responses path (`reasoning.effort`). A clean `off` is expressible as "none"
-// on the models that accept it; the rest fall back to the Completions table.
-// https://help.aliyun.com/zh/model-studio/compatibility-with-openai-responses-api
-const RESPONSES_EFFORT_MAP: Record<string, string | null> = {
-  off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
-};
-// No literal "none" — thinking cannot be switched off on these ids.
-const RESPONSES_NO_OFF_MAX: Record<string, string | null> = {
-  off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
-};
-// Only up to `medium` is accepted.
-const RESPONSES_MEDIUM_CEILING: Record<string, string | null> = {
-  off: "none", minimal: "minimal", low: "low", medium: "medium", high: null, xhigh: null, max: null,
-};
-// Only the literal "none" is accepted.
-const RESPONSES_NONE_ONLY: Record<string, string | null> = {
-  off: "none", minimal: null, low: null, medium: null, high: null, xhigh: null, max: null,
-};
+// Responses accepts the same effort subset as Completions per family (the
+// docs point back to the Chat Completions table), with `off` expressible as
+// the literal effort "none" wherever thinking can be switched off at all.
+// Only families measured *narrower* on Responses carry an explicit override.
+const responsesFrom = (completions: Levels): Levels => ({
+  ...completions,
+  off: completions.off ? "none" : null,
+});
+
+interface FamilyCaps {
+  /** Present on named families; exotic ids fall back to REASONING_HEURISTIC. */
+  reasoning?: boolean;
+  completions: Levels;
+  /** false → the family rejects `reasoning_effort` outright (GLM-4.5). */
+  effort?: boolean;
+  /** Narrower than the derived Responses map (measured); else derived. */
+  responses?: Levels;
+  /** /responses can serve this family at all (measured 2026-09-22). */
+  responsesCapable?: boolean;
+}
+
+// One row per family — the single place a new family or snapshot touches.
+// Order matters: the first match wins, most specific id first.
+const FAMILIES: Array<[RegExp, FamilyCaps]> = [
+  [/^qwen3\.8-2\.4t/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true }],
+  [/^qwen3\.7-max-(preview|\d{4}-\d{2}-\d{2})/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true }],
+  [/^qwen3\.8/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
+  [/^qwen3\.7-(max|plus)/i, { reasoning: true, completions: L_NO_MAX, responsesCapable: true }],
+  [/^qwen3\.[5-7]/i, { reasoning: true, completions: L_NO_MAX, responses: L_MEDIUM_CEILING, responsesCapable: true }],
+  [/^qwen3-max|^qwen3-(coder|next)/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
+  [/^qwen3-\d/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
+  [/^qwen-(plus|flash)(-|$)/i, { reasoning: true, completions: L_ALL, responses: L_NONE_ONLY, responsesCapable: true }],
+  [/^qwen-turbo(-|$)/i, { reasoning: false, completions: L_ALL, responses: L_NONE_ONLY, responsesCapable: true }],
+  [/^glm-?5\.3/i, { reasoning: true, completions: L_GLM53, responsesCapable: true }],
+  [/^glm-?5\.2/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
+  [/^glm-?4\.6/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
+  [/^glm-?4\.5/i, { reasoning: true, completions: L_ALL, effort: false, responses: L_ALWAYS_ON }],
+  [/^glm-?5\.1|^glm-?5\b/i, { reasoning: true, completions: L_NO_MAX }],
+  [/^glm/i, { reasoning: true, completions: L_ALL }],
+  [/^deepseek-?v4\.1/i, { reasoning: true, completions: L_DEEPSEEK_V41, responsesCapable: true }],
+  [/^deepseek-?v4/i, { reasoning: true, completions: L_DEEPSEEK_V4, responsesCapable: true }],
+  [/^deepseek-?v3\.1/i, { reasoning: true, completions: L_ALL, responsesCapable: true }],
+  [/^deepseek/i, { reasoning: true, completions: L_ALL }],
+  [/^minimax-?m2\.5/i, { reasoning: true, completions: L_MINIMAX25 }],
+  [/^minimax-?m2\.1/i, { reasoning: true, completions: L_ALWAYS_ON, responsesCapable: true }],
+  [/^minimax/i, { reasoning: true, completions: L_ALL }],
+  [/^kimi-k3/i, { reasoning: false, completions: L_ALL, responsesCapable: true }],
+  [/^kimi/i, { reasoning: false, completions: L_NO_MAX }],
+];
+
+const DEFAULT_CAPS: FamilyCaps = { completions: L_ALL };
+function capsFor(id: string): FamilyCaps {
+  for (const [match, caps] of FAMILIES) if (match.test(id)) return caps;
+  return DEFAULT_CAPS;
+}
 
 const OPENAI_BASE_COMPAT = {
   thinkingFormat: "qwen" as const,
@@ -324,60 +419,23 @@ export interface ThinkingConfig {
 
 export function thinkingConfigFor(id: string, api: string): ThinkingConfig | undefined {
   if (!isReasoningModel(id)) return undefined;
-  if (api === "openai-completions") return completionsThinkingConfig(id);
-  if (api === "openai-responses") return responsesThinkingConfig(id);
-  // Anthropic-compatible: pi derives the thinking budget from the level, so
-  // every level is selectable and `off` maps to `thinking: {type: "disabled"}`.
-  return {
-    thinkingLevelMap: { ...ANTHROPIC_ALL_LEVELS },
-    compat: { thinkingFormat: "qwen" },
-  };
-}
-
-function completionsThinkingConfig(id: string): ThinkingConfig {
-  const send = (map: Record<string, string | null>): ThinkingConfig => ({
-    thinkingLevelMap: { ...map },
-    compat: { ...OPENAI_BASE_COMPAT, supportsReasoningEffort: true },
-  });
-  if (/^qwen3\.8-2\.4t/i.test(id)) return send(COMPLETIONS_ALWAYS_ON);
-  if (/^qwen3\.7-max-(preview|2026-05-17)/i.test(id)) return send(COMPLETIONS_ALWAYS_ON);
-  if (/^qwen3\.8/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
-  if (/^qwen3\.[5-7]/i.test(id)) return send(COMPLETIONS_NO_MAX);
-  if (/^qwen3-max|^qwen3-(coder|next)/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
-  if (/^qwen3-\d/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
-  if (/^glm-?5\.3/i.test(id)) return send(COMPLETIONS_GLM53);
-  // GLM-4.5/4.5-Air reject `reasoning_effort` outright, so compat must not
-  // advertise support; the level strings are then never sent and the server
-  // runs thinking at its own default.
-  if (/^glm-?4\.5/i.test(id)) return { thinkingLevelMap: { ...COMPLETIONS_UNIVERSAL }, compat: { ...OPENAI_BASE_COMPAT } };
-  if (/^glm/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
-  if (/^deepseek-?v4/i.test(id)) return send(COMPLETIONS_GLM_DEEPSEEK);
-  if (/^minimax-?m2\.5/i.test(id)) return send(COMPLETIONS_MINIMAX25);
-  if (/^minimax-?m2\.1/i.test(id)) return send(COMPLETIONS_MINIMAX21);
-  if (/^kimi-k3/i.test(id)) return send(COMPLETIONS_UNIVERSAL);
-  if (/^kimi/i.test(id)) return send(COMPLETIONS_NO_MAX);
-  return send(COMPLETIONS_UNIVERSAL);
-}
-
-function responsesThinkingConfig(id: string): ThinkingConfig {
-  const base = (map: Record<string, string | null>): ThinkingConfig => ({
-    thinkingLevelMap: { ...map },
-    compat: { ...OPENAI_BASE_COMPAT },
-  });
-  // Measured acceptance per family (table above). `reasoning.effort` replaces
-  // the Completions `enable_thinking` toggle, so `off` becomes the literal
-  // effort "none" wherever the model accepts it.
-  if (/^qwen3\.8-2\.4t/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
-  if (/^qwen3\.7-max-(preview|2026-05-17)/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
-  if (/^qwen3\.8/i.test(id)) return base(RESPONSES_EFFORT_MAP);
-  if (/^qwen3\.7-(max|plus)/i.test(id)) return base(RESPONSES_EFFORT_MAP);
-  if (/^glm-?5\.3/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
-  if (/^glm-?4\.5/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
-  if (/^deepseek-?v4/i.test(id)) return base(RESPONSES_EFFORT_MAP);
-  if (/^minimax-?m2\.1$/i.test(id)) return base(RESPONSES_NO_OFF_MAX);
-  if (/^qwen3\.([5-7])/i.test(id)) return base(RESPONSES_MEDIUM_CEILING);
-  if (/^qwen-(plus|flash|turbo)(-|$)/i.test(id)) return base(RESPONSES_NONE_ONLY);
-  return base(RESPONSES_EFFORT_MAP);
+  const caps = capsFor(id);
+  if (api === "openai-completions") {
+    return {
+      thinkingLevelMap: { ...caps.completions },
+      compat: { ...OPENAI_BASE_COMPAT, ...(caps.effort === false ? {} : { supportsReasoningEffort: true }) },
+    };
+  }
+  if (api === "openai-responses") {
+    return {
+      thinkingLevelMap: { ...(caps.responses ?? responsesFrom(caps.completions)) },
+      compat: { ...OPENAI_BASE_COMPAT },
+    };
+  }
+  // Anthropic-compatible: pi derives the thinking budget from the level name,
+  // so every level stays selectable and `--thinking off` serializes as
+  // `thinking: {type: "disabled"}` (see ANTHROPIC_ALL_LEVELS).
+  return { thinkingLevelMap: { ...ANTHROPIC_ALL_LEVELS }, compat: { thinkingFormat: "qwen" } };
 }
 
 // Cloud models the Responses endpoint cannot serve (measured 2026-09-22).
@@ -385,15 +443,7 @@ function responsesThinkingConfig(id: string): ThinkingConfig {
 // on Chat Completions instead of being exposed and then 400ing on send.
 // Families are matched by id so brand-new snapshots inherit the behaviour.
 export function supportsCloudResponses(id: string): boolean {
-  if (/^qwen3\.\d/i.test(id)) return true;
-  if (/^qwen3-/i.test(id)) return true;
-  if (/^qwen-(plus|flash|turbo)(-|$)/i.test(id)) return true;
-  if (/^deepseek-?v4/i.test(id)) return true;
-  if (/^deepseek-?v3\.1/i.test(id)) return true;
-  if (/^kimi-k3/i.test(id)) return true;
-  if (/^glm-?(4\.6|5\.[23])/i.test(id)) return true;
-  if (/^minimax-?m2\.1$/i.test(id)) return true;
-  return false;
+  return capsFor(id).responsesCapable === true;
 }
 
 export function resolveCloudApi(id: string, fmt: CloudApiFormat): CloudApiFormat {
@@ -413,7 +463,6 @@ function inferPlanDef(id: string, overrides?: Record<string, number>): PlanModel
     reasoning: isReasoning,
     input: isVision ? ["text", "image"] : ["text"],
     contextWindow: inferContextWindow(id, overrides),
-    maxTokens: openaiOnly ? inferOpenAIMaxTokens(id) : inferAnthropicMaxTokens(id),
     compat: isReasoning ? { thinkingFormat: "qwen" } : undefined,
     openaiOnly,
   };
@@ -488,10 +537,8 @@ export function buildPlanModels(defs: PlanModelDef[], openaiUrl: string, anthrop
     return {
       id: m.id, name: m.name, reasoning: m.reasoning, input: m.input,
       contextWindow: m.contextWindow,
-      maxTokens: useOpenAI ? m.maxTokens : inferAnthropicMaxTokens(m.id),
-      compat: useOpenAI
-        ? { ...(m.compat ?? {}), ...(tc?.compat ?? {}), supportsDeveloperRole: false, supportsStore: false }
-        : (tc?.compat ?? m.compat),
+      maxTokens: resolveMaxTokens(m.id, api, m.catalogMaxTokens),
+      compat: mergeCompat(m.compat, tc, useOpenAI),
       thinkingLevelMap: tc?.thinkingLevelMap,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       baseUrl: useOpenAI ? openaiUrl : anthropicUrl,
@@ -571,17 +618,22 @@ async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<Provi
         const ctx = m.model_info?.context_window;
         const maxOut = m.model_info?.max_output_tokens;
         const price = parseApiV1Prices(m.prices);
-        const kimi = /^kimi/i.test(m.model);
         models.push({
           id: m.model,
           name: m.name || m.model,
-          reasoning: kimi ? false : (isReasoningModel(m.model) || caps.includes("Reasoning")),
+          // The catalog's `Reasoning` tag is deliberately ignored (see
+          // isReasoningModel) — OR-ing it in reintroduces its false positives
+          // (`qwen-turbo`) and its misses (`qwen3-30b-a3b`).
+          reasoning: isReasoningModel(m.model),
           input: isVisionModel(m.model) || reqMod.includes("Image") || caps.includes("VU")
             ? (["text", "image"] as ("text" | "image")[])
             : (["text"] as ("text" | "image")[]),
           cost: { input: price.input, output: price.output, cacheRead: 0, cacheWrite: 0 },
           contextWindow: typeof ctx === "number" && ctx > 0 ? ctx : inferContextWindow(m.model, overrides),
-          maxTokens: typeof maxOut === "number" && maxOut > 0 ? maxOut : inferOpenAIMaxTokens(m.model),
+          // 0 = "the catalog has no max_output_tokens row". A guessed ceiling
+          // must never masquerade as a catalog value here — resolveMaxTokens
+          // treats one as authoritative and DashScope rejects overshoots.
+          maxTokens: typeof maxOut === "number" && maxOut > 0 ? maxOut : 0,
         });
       }
       if (models.length >= (output.total ?? 0) || output.models.length < 100) break;
@@ -617,7 +669,8 @@ async function fetchCloudModelsCompat(domain: string, apiKey: string): Promise<P
           input: isVision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: inferContextWindow(m.id, overrides),
-          maxTokens: inferOpenAIMaxTokens(m.id),
+          // compatible-mode /v1/models carries no catalog rows at all.
+          maxTokens: 0,
         };
       });
   } finally { clearTimeout(t); }
@@ -763,19 +816,9 @@ export function buildCloudModels(models: ProviderModelConfig[], domain: string, 
     const openai = api !== "anthropic-messages";
     return {
       ...m,
-      maxTokens: api === "anthropic-messages" ? inferAnthropicMaxTokens(m.id, m.maxTokens) : (m.maxTokens || inferOpenAIMaxTokens(m.id)),
+      maxTokens: resolveMaxTokens(m.id, api, m.maxTokens),
       thinkingLevelMap: tc?.thinkingLevelMap,
-      compat: openai
-        ? {
-            ...(m.compat ?? {}),
-            ...(tc?.compat ?? {}),
-            // compatible-mode rejects the `developer` role
-            // (`developer is not one of ['system', ...]`) and has no `store`
-            // field, so both stay off on every Cloud model.
-            supportsDeveloperRole: false,
-            supportsStore: false,
-          }
-        : (tc?.compat ?? m.compat),
+      compat: mergeCompat(m.compat, tc, openai),
       baseUrl: openai ? `https://${domain}/compatible-mode/v1` : `https://${domain}/apps/anthropic`,
       api,
     };
@@ -1057,7 +1100,6 @@ function rehydratePlan(models: PlanModelDef[]): PlanModelDef[] {
       reasoning: fresh.reasoning,
       input: fresh.input,
       contextWindow: fresh.contextWindow,
-      maxTokens: fresh.maxTokens,
       compat: fresh.compat,
       openaiOnly: fresh.openaiOnly,
     };
@@ -1067,8 +1109,7 @@ function rehydratePlan(models: PlanModelDef[]): PlanModelDef[] {
 function rehydrateCloud(models: ProviderModelConfig[]): ProviderModelConfig[] {
   const overrides = loadConfig().contextWindowOverrides;
   return models.map((m) => {
-    const kimi = /^kimi/i.test(m.id);
-    const reasoning = kimi ? false : (isReasoningModel(m.id) || !!m.reasoning);
+    const reasoning = isReasoningModel(m.id);
     const vision = isVisionModel(m.id) || m.input?.includes("image");
     const override = overrides?.[m.id] ?? overrides?.["*"];
     return {
@@ -1078,7 +1119,9 @@ function rehydrateCloud(models: ProviderModelConfig[]): ProviderModelConfig[] {
       contextWindow: typeof override === "number" && override > 0
         ? override
         : (m.contextWindow > 0 ? m.contextWindow : inferContextWindow(m.id, overrides)),
-      maxTokens: m.maxTokens > 0 ? m.maxTokens : inferOpenAIMaxTokens(m.id),
+      // Keep a real catalog row as-is; 0 stays 0 ("no catalog row") so a
+      // guessed ceiling is never passed off as one. Builders resolve display.
+      maxTokens: m.maxTokens > 0 ? m.maxTokens : 0,
     };
   });
 }

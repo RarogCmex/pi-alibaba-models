@@ -33,7 +33,7 @@ const nonReasoning = {
   compat: undefined,
 };
 
-const EXPECTED_REASONING_MAP = {
+const ANTHROPIC_LEVELS = {
   off: "off",
   minimal: "minimal",
   low: "low",
@@ -63,8 +63,8 @@ describe("thinkingLevelMap", () => {
     );
     const [cloud] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
 
-    assert.deepEqual(plan.thinkingLevelMap, EXPECTED_REASONING_MAP);
-    assert.deepEqual(cloud.thinkingLevelMap, EXPECTED_REASONING_MAP);
+    assert.deepEqual(plan.thinkingLevelMap, ANTHROPIC_LEVELS);
+    assert.deepEqual(cloud.thinkingLevelMap, ANTHROPIC_LEVELS);
     assert.equal(plan.thinkingLevelMap?.off, "off");
   });
 
@@ -110,6 +110,12 @@ describe("isReasoningModel", () => {
   it("does not flag the -character roleplay variants", () => {
     assert.equal(isReasoningModel("qwen-plus-character"), false);
     assert.equal(isReasoningModel("qwen-flash-character"), false);
+    assert.equal(isReasoningModel("qwen3-max-character"), false);
+  });
+
+  it("flags qwen3-coder/next via the family table (the heuristic missed them)", () => {
+    assert.equal(isReasoningModel("qwen3-coder-plus"), true);
+    assert.equal(isReasoningModel("qwen3-next"), true);
   });
 });
 
@@ -151,6 +157,7 @@ describe("openai-responses", () => {
     assert.equal(cloud.baseUrl, "https://dashscope.example/compatible-mode/v1");
     assert.equal(compatFlags(cloud).supportsDeveloperRole, false);
     assert.equal(compatFlags(cloud).supportsStore, false);
+    // Derived from the family's Completions map — qwen3.7-max rejects `max`.
     assert.deepEqual(cloud.thinkingLevelMap, {
       off: "none",
       minimal: "minimal",
@@ -158,7 +165,7 @@ describe("openai-responses", () => {
       medium: "medium",
       high: "high",
       xhigh: "xhigh",
-      max: "max",
+      max: null,
     });
   });
 
@@ -200,8 +207,11 @@ describe("thinkingConfigFor", () => {
 
   it("hides the levels Chat Completions cannot express per family", () => {
     const glm53 = thinkingConfigFor("glm-5.3", "openai-completions");
+    // Only low/high/max are distinct — the docs coerce medium to high and
+    // xhigh to max — so the coerced levels are hidden and pi clamps onto the
+    // very same values.
     assert.deepEqual(glm53?.thinkingLevelMap, {
-      off: null, minimal: null, low: "low", medium: "high", high: "high", xhigh: null, max: "max",
+      off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max",
     });
     // Everything above `medium` is rejected on qwen3.6-plus.
     const qwen36 = thinkingConfigFor("qwen3.6-plus", "openai-completions");
@@ -237,6 +247,47 @@ describe("maxTokens vs API shape", () => {
   it("falls back to a conservative ceiling when the catalog has no row", () => {
     assert.equal(inferAnthropicMaxTokens("qwen3.7-max"), 32_768);
     assert.equal(inferAnthropicMaxTokens("qwen-turbo"), 8_192);
+    // The open-weight qwen3-<size>b line is measured at 8192.
+    assert.equal(inferAnthropicMaxTokens("qwen3-30b-a3b"), 8_192);
+    // 0 is how producers mark "the catalog has no row".
+    assert.equal(inferAnthropicMaxTokens("qwen3.7-max", 0), 32_768);
+  });
+
+  it("never lets an id-based guess masquerade as a catalog row", () => {
+    // OpenAI-path guesses (glm-5.1 128000, kimi-k3 1048576) must not leak
+    // onto the Anthropic path — DashScope rejects overshoots outright with
+    // `Range of max_tokens should be [1, N]`. (deepseek is force-routed to
+    // Completions anyway; glm-5.1 and kimi-k3 stay on the Anthropic path.)
+    const [glm51] = buildCloudModels(
+      [{ ...reasoningQwen, id: "glm-5.1", maxTokens: 0 }],
+      "dashscope.example",
+      "anthropic-messages",
+    );
+    assert.equal(glm51.maxTokens, 32_768);
+    const [kimi] = buildCloudModels(
+      [{ ...nonReasoning, id: "kimi-k3", maxTokens: 0 }],
+      "dashscope.example",
+      "anthropic-messages",
+    );
+    assert.equal(kimi.maxTokens, 8_192);
+  });
+
+  it("honors a catalog row on the Plan path as well", () => {
+    const def = {
+      id: "qwen3-coder-plus",
+      name: "Qwen 3 Coder Plus",
+      reasoning: true,
+      input: ["text" as const],
+      contextWindow: 262_144,
+    };
+    const [withCatalog] = buildPlanModels(
+      [{ ...def, catalogMaxTokens: 65_536 }],
+      "https://plan.example/openai",
+      "https://plan.example/anthropic",
+    );
+    assert.equal(withCatalog.maxTokens, 65_536);
+    const [fallback] = buildPlanModels([def], "https://plan.example/openai", "https://plan.example/anthropic");
+    assert.equal(fallback.maxTokens, 32_768);
   });
 
   it("keeps catalog maxTokens on OpenAI Completions and Responses", () => {
@@ -245,6 +296,38 @@ describe("maxTokens vs API shape", () => {
     const [responses] = buildCloudModels([fat], "dashscope.example", "openai-responses");
     assert.equal(completions.maxTokens, 131_072);
     assert.equal(responses.maxTokens, 131_072);
+  });
+});
+
+describe("per-family capability table", () => {
+  it("splits DeepSeek v4-pro/flash from v4.1 (distinct efforts differ)", () => {
+    // deepseek-v4-pro/flash: only high/max are distinct (the docs coerce
+    // low/medium to high and xhigh to max); v4.1 adds low and an off switch.
+    assert.deepEqual(thinkingConfigFor("deepseek-v4-pro", "openai-completions")?.thinkingLevelMap, {
+      off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max",
+    });
+    assert.deepEqual(thinkingConfigFor("deepseek-v4.1-flash", "openai-completions")?.thinkingLevelMap, {
+      off: "none", minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max",
+    });
+  });
+
+  it("drops `max` for glm-5.1/glm-5, which reject it", () => {
+    assert.equal(thinkingConfigFor("glm-5.1", "openai-completions")?.thinkingLevelMap.max, null);
+    assert.equal(thinkingConfigFor("glm-5", "openai-completions")?.thinkingLevelMap.off, "none");
+    assert.equal(thinkingConfigFor("glm-5.2", "openai-completions")?.thinkingLevelMap.max, "max");
+  });
+
+  it("derives Responses efforts from the family's Completions map", () => {
+    // Docs: Responses accepts the same subset per family, with `off` as the
+    // literal effort "none" wherever thinking can be disabled at all.
+    assert.deepEqual(thinkingConfigFor("deepseek-v4-pro", "openai-responses")?.thinkingLevelMap, {
+      off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max",
+    });
+    assert.equal(thinkingConfigFor("deepseek-v4.1-flash", "openai-responses")?.thinkingLevelMap.off, "none");
+    // Measured narrower on Responses: qwen3.5–3.7 cap at medium.
+    const qwen36 = thinkingConfigFor("qwen3.6-plus", "openai-responses");
+    assert.equal(qwen36?.thinkingLevelMap.medium, "medium");
+    assert.equal(qwen36?.thinkingLevelMap.high, null);
   });
 });
 

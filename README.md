@@ -54,7 +54,7 @@ After install, restart `pi`. The extension registers two providers and a slash c
 If you've already run `pi remove` and want to clean leftovers manually:
 
 ```bash
-rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-plan-models.cache.json
+rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-plan-models.cache.json ~/.pi/agent/alibaba-cloud-models.cache*.json
 # then edit ~/.pi/agent/auth.json and remove the "alibaba-plan" / "alibaba-cloud" entries
 # then edit ~/.pi/agent/settings.json and drop any "alibaba-*/..." or "dashscope/..." entries from enabledModels
 ```
@@ -151,7 +151,7 @@ The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, tex
 - **API Wrapper Quirks**: Alibaba's native Anthropic compatibility layer can occasionally be strict or quirky with complex parallel tool calls. If you experience systemic parsing errors on DashScope, switch Cloud API format to "OpenAI Chat Completions" or "OpenAI Responses".
 - **Responses API**: not every model supports every built-in DashScope tool, and `xhigh`/`max` effort are documented for Beijing/Singapore. If a model errors out, switch back to Chat Completions or Anthropic for that session.
 - **`alibaba_tools`**: Cloud key required (`/login` or `$DASHSCOPE_API_KEY`). Qwen only — 3.7 Max / 3.6 Plus+ search is Responses-only. Completions search does not return source URLs; Responses search/research can. Auto sidecar model prefers Flash/Plus over Max. Search usage is billed on the sidecar call. A silent hang should not happen: the tool card streams elapsed time and built-in calls. Sidecar 429s and transient `server_error` backend failures (`Backend buffer overflow`) retry inside the tool (user sees `429 / server_error, retrying…`; the model only gets the final result). If it still times out, narrow the task or raise `ALIBABA_SIDECAR_TIMEOUT_MS`.
-- **Output budget vs. thinking budget**: On the Anthropic path, `max_tokens` is a **total** budget shared between thinking and the final answer. pi splits the card's `maxTokens` accordingly, so a card value of 8192 leaves only 8192 − 7168 = **1024 tokens** for the actual answer at high thinking — enough to truncate large tool calls (e.g. big `write`/`edit` content) mid-arguments. Reasoning models therefore report `maxTokens: 32768` (the verified universal ceiling — non-reasoning `qwen-plus` rejects 65536 with `Range of max_tokens should be [1, 32768]`), which yields a 16384-token answer budget at high thinking. Non-reasoning models keep 8192: pi sends it straight as the output cap, so there is no squeeze to fix. Completions and Responses keep the catalog's larger output ceilings.
+- **Output budget vs. thinking budget**: On the Anthropic path, `max_tokens` is a **total** budget shared between thinking and the final answer. pi splits the card's `maxTokens` accordingly, so a card value of 8192 leaves only 8192 − 7168 = **1024 tokens** for the actual answer at high thinking — enough to truncate large tool calls (e.g. big `write`/`edit` content) mid-arguments. The card therefore reports the model's own catalog `max_output_tokens` whenever the catalog has a row (clamped at 131072 — e.g. `qwen-plus` = 32768, which yields a 16384-token answer budget at high thinking). Models with **no** catalog row keep a conservative fallback (32768; 8192 for non-reasoning ids and the open-weight `qwen3-<size>b` line, measured at 8192), because overshooting the real ceiling is rejected outright with `Range of max_tokens should be [1, N]`. Completions and Responses keep the catalog's larger output ceilings.
 - **Dynamic Caching**: Model lists are cached for 4 hours. If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists`.
 - **Inferred Context Windows**: Compatible-mode `/v1/models` returns only ids and names, so context windows are inferred from the model id unless native `/api/v1/models` supplied a real value. If a brand-new model shows the wrong size, fix it yourself with `/alibaba → Context Window — Override` (per model, or `*` for all) — no extension update needed.
 
@@ -201,7 +201,7 @@ All paths live in pi's config directory — `~/.pi/agent` by default, or `$PI_CO
 | `~/.pi/agent/auth.json`                               | Both provider credentials (0600)   |
 | `~/.pi/agent/alibaba-config.json`                     | Endpoint / domain / format config  |
 | `~/.pi/agent/alibaba-plan-models.cache.json`          | 4 h plan-models cache              |
-| `~/.pi/agent/alibaba-cloud-models.cache.json`         | 4 h cloud-models cache             |
+| `~/.pi/agent/alibaba-cloud-models.cache.v2.json`   | 4 h cloud-models cache             |
 
 ## From the same author
 
