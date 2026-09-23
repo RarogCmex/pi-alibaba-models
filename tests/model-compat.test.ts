@@ -4,6 +4,7 @@ import {
   applyAuthorizedFilter,
   buildCloudModels,
   buildPlanModels,
+  catalogFresh,
   formatQuota,
   inferAnthropicMaxTokens,
   isReasoningModel,
@@ -358,6 +359,18 @@ describe("prompt caching + DashScope session cache", () => {
     assert.equal((completions as { headers?: Record<string, string> }).headers, undefined);
     const [anthropic] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
     assert.equal((anthropic as { headers?: Record<string, string> }).headers, undefined);
+  });
+});
+
+describe("catalog fetch freshness gate (many pi instances, one agent dir)", () => {
+  it("lets one instance fetch per window and the rest skip", () => {
+    const NOW = 1_800_000_000_000;
+    const WINDOW_MS = 10 * 60 * 1000;
+    assert.equal(catalogFresh(NOW, NOW), true);
+    assert.equal(catalogFresh(NOW - WINDOW_MS + 1000, NOW), true);
+    assert.equal(catalogFresh(NOW - WINDOW_MS, NOW), false);
+    assert.equal(catalogFresh(undefined, NOW), false);
+    assert.equal(catalogFresh(NaN, NOW), false);
   });
 });
 

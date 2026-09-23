@@ -1141,12 +1141,23 @@ type RefreshCtx = {
   stored?: { models?: readonly ProviderModelConfig[] };
 };
 
+// Coordination for many pi instances sharing one agent dir: alibaba-config.json
+// is the shared, last-writer-wins record of "someone just fetched". While it is
+// fresh, the other instances skip their own fetch and are served pi's stored
+// snapshot through `refreshModels` instead. `force` (Refresh model lists)
+// always fetches. No lockfile — the GET is idempotent, so simultaneous cold
+// starts may race once per window and that is fine.
+const CATALOG_FRESH_MS = 10 * 60 * 1000;
+export const catalogFresh = (fetchedAt?: number, now = Date.now()): boolean =>
+  typeof fetchedAt === "number" && Number.isFinite(fetchedAt) && now - fetchedAt < CATALOG_FRESH_MS;
+
 // Best-effort fetch: a failure keeps whatever we already hold and warns.
 async function loadPlanCatalog(force: boolean): Promise<PlanModelDef[]> {
+  const cfg = loadConfig();
+  if (!force && catalogFresh(cfg.planFetchedAt)) return planDefs;
   try {
     const defs = await fetchPlanModels(force, readAuth()["alibaba-plan"]);
     planDefs = defs;
-    const cfg = loadConfig();
     cfg.planFetchedAt = Date.now();
     saveConfig(cfg);
     return defs;
@@ -1157,10 +1168,11 @@ async function loadPlanCatalog(force: boolean): Promise<PlanModelDef[]> {
 }
 
 async function loadCloudCatalog(domain: string, apiKey: string, force: boolean): Promise<ProviderModelConfig[]> {
+  const cfg = loadConfig();
+  if (!force && catalogFresh(cfg.cloudFetchedAt)) return cloudDefs;
   try {
     const { models, authorizedOnly } = await fetchCloudModels(domain, apiKey, force);
     cloudDefs = models.length ? models : CLOUD_LOGIN_SEED;
-    const cfg = loadConfig();
     cfg.cloudFetchedAt = Date.now();
     cfg.cloudAuthorizedFilteredLast = authorizedOnly;
     saveConfig(cfg);
@@ -1190,10 +1202,14 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelCon
   const domain = cfg.cloudDomain || DEFAULT_CLOUD_DOMAIN;
   const fmt = cfg.cloudApiFormat || "anthropic-messages";
   const key = readCloudKey();
+  // The login seed must never shadow pi's stored snapshot in the offline phase.
+  const held = cloudDefs.length && cloudDefs !== CLOUD_LOGIN_SEED
+    ? cloudDefs
+    : ((context.stored?.models ?? []) as unknown as ProviderModelConfig[]);
   const defs = key
     ? (context.allowNetwork
       ? await loadCloudCatalog(domain, key, !!context.force)
-      : (cloudDefs.length ? cloudDefs : ((context.stored?.models ?? []) as unknown as ProviderModelConfig[])))
+      : held)
     : [];
   return buildCloudModels(defs.length ? defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
 };
