@@ -1218,10 +1218,13 @@ function updateCatalogCache(patch: Partial<CatalogCache>) {
 // Boot seed: registration gets the snapshot immediately (zero network, so
 // `pi --list-models` and enabledModels validation see real ids), while the
 // timestamp still governs freshness and the lock still governs fetches.
+// Fill-only: a seed never overwrites a catalog we already hold.
 function seedFromSnapshot() {
   const cache = readCatalogCache();
-  if (cache?.plan?.models?.length) planDefs = cache.plan.models;
-  if (cache?.cloud?.models?.length) cloudDefs = cache.cloud.models;
+  if (!planDefs.length && cache?.plan?.models?.length) planDefs = cache.plan.models;
+  if ((!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) && cache?.cloud?.models?.length) {
+    cloudDefs = cache.cloud.models;
+  }
 }
 
 type CatalogResult<T> = { defs: T[]; fetched: boolean }; 
@@ -1285,9 +1288,11 @@ const planRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConf
   }
   const result = await loadPlanCatalog(!!context.force);
   const built = buildPlanModels(result.defs, ep.openai, ep.anthropic, overrides);
-  // Exactly one models-store.json write per real fetch — pi's legacy
-  // ProviderConfig does not persist refreshModels returns by itself.
-  if (result.fetched && result.defs.length) {
+  // One models-store.json write per real fetch (pi's legacy ProviderConfig
+  // does not persist refreshModels returns by itself) — plus a catch-up write
+  // when the bonus channel is empty while we do hold a catalog (the boot
+  // force-refresh fills the private bundle first).
+  if (result.defs.length && (result.fetched || !context.stored?.models?.length)) {
     await context.publish?.({ persist: { models: built, checkedAt: Date.now() } });
   }
   return built;
@@ -1310,8 +1315,9 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelCon
   }
   const result = await loadCloudCatalog(domain, key, !!context.force);
   const built = buildCloudModels(result.defs.length ? result.defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides);
-  // One store write per real fetch (see planRefreshModels).
-  if (result.fetched && result.defs.length && result.defs !== CLOUD_LOGIN_SEED) {
+  // One store write per real fetch (see planRefreshModels), with the same
+  // catch-up when the bonus channel is empty.
+  if (result.defs.length && result.defs !== CLOUD_LOGIN_SEED && (result.fetched || !context.stored?.models?.length)) {
     await context.publish?.({ persist: { models: built, checkedAt: Date.now() } });
   }
   return built;
@@ -1493,14 +1499,21 @@ export default async function (pi: ExtensionAPI) {
     return { message: { ...message, errorMessage: rewritten } };
   });
 
-  // Catalogs flow through pi: `refreshModels` serves pi's stored snapshot at
-  // startup (measured: pi calls it in a cache-only phase), and session_start /
-  // "Refresh model lists" fetch under the cross-instance lock and publish the
-  // snapshot to models-store.json exactly once per real fetch. The Cloud
-  // registration falls back to the login seed so it stays visible in /login
-  // with no catalog yet (issue #1).
-  if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
+  // Startup contract (plan C): seed registration from the private bundle;
+  // when the bundle is missing (first run, fresh agent dir, right after
+  // "Reset all") force-refresh right here instead of booting an empty catalog
+  // and waiting for session_start. The lockfile keeps a fleet from all
+  // fetching — a loser of the race just registers what the winner bundled.
   seedFromSnapshot();
+  const planCred = readAuth()["alibaba-plan"];
+  const bootKey = readCloudKey();
+  if (!planDefs.length && planCred?.access) await loadPlanCatalog(true);
+  if ((!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) && bootKey) {
+    await loadCloudCatalog(loadConfig().cloudDomain || DEFAULT_CLOUD_DOMAIN, bootKey, true);
+  }
+  seedFromSnapshot();
+  // Keep the Cloud provider visible in /login even with no models yet (issue #1).
+  if (!cloudDefs.length) cloudDefs = CLOUD_LOGIN_SEED;
   registerPlanProvider(pi);
   registerCloudProvider(pi);
 
