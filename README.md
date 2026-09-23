@@ -25,19 +25,19 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's
 
 ## Install
 
+> **Distribution status.** This repository is a **personal fork** (original: [Fornace/pi-alibaba-models](https://github.com/Fornace/pi-alibaba-models)), built for one's own use first. There is **no npm release line for this fork** — publishing under a personal npm name is a distant plan. `pi install pi-alibaba-models` / `pi install npm:pi-alibaba-models` resolve the **original, much older** npm package, not this fork. Install from git or a local checkout.
+
 ```bash
-# recommended
-pi install pi-alibaba-models
-
-# explicit npm form (fallback if the bare name doesn't resolve)
-pi install npm:pi-alibaba-models
-
-# or from GitHub
-pi install git:github.com/Fornace/pi-alibaba-models
+# from this fork (recommended)
+pi install git:github.com/RarogCmex/pi-alibaba-models
 
 # or from a local checkout (development)
-git clone https://github.com/Fornace/pi-alibaba-models
+git clone https://github.com/RarogCmex/pi-alibaba-models
 cd pi-alibaba-models && pi install .
+
+# the bare name / npm form installs the ORIGINAL upstream package, not this fork:
+#   pi install pi-alibaba-models
+#   pi install npm:pi-alibaba-models
 ```
 
 After install, restart `pi`. The extension registers two providers and a slash command on every boot.
