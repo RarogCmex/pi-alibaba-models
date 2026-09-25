@@ -2,6 +2,8 @@ import { getAgentDir, type ExtensionAPI, type ProviderModelConfig, type Extensio
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { assertSingleInstall, findPackageRoot } from "./duplicate-guard.ts";
 import {
   ALIBABA_TOOLS_PARAMETERS,
   buildSidecarRequest,
@@ -23,6 +25,21 @@ import {
 // ~/.pi/agent here made the extension miss /login credentials and scrub the
 // wrong settings.json under an override.
 const HOME_DIR = getAgentDir();
+
+// This copy's own package directory, so the duplicate guard can tell "the
+// other copy" apart from "me". extensionPath is not exposed to factories, but
+// extension files always sit in <packageRoot>/extensions/, so the manifest one
+// directory up identifies us. Resolved once — the module is a singleton.
+const resolveOwnPackageDir = (): string | null => {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const root = findPackageRoot(here);
+    if (!root) return null;
+    try { return fs.realpathSync(root); } catch { return root; }
+  } catch {
+    return null;
+  }
+};
 const CONFIG_PATH = path.join(HOME_DIR, "alibaba-config.json");
 const AUTH_PATH = path.join(HOME_DIR, "auth.json");
 // Private, versioned catalog snapshot (the "plan C" hybrid): it fills provider
@@ -1665,6 +1682,18 @@ function registerCloudProvider(pi: ExtensionAPI) {
 }
 
 export default async function (pi: ExtensionAPI) {
+  // Refuse to run next to another configured copy of this plugin. pi resolves
+  // the resulting `alibaba-cloud` registration collision last-wins, so the
+  // shadowed copy's wire format and maxTokens silently lose — the failure that
+  // truncated long answers at 1024 output tokens (see duplicate-guard.ts).
+  // Runs first: nothing may be registered for a session that must not start.
+  assertSingleInstall({
+    agentDir: HOME_DIR,
+    cwd: process.cwd(),
+    selfDir: resolveOwnPackageDir(),
+    argv: process.argv.slice(2),
+  });
+
   migrateLegacyAuth();
   const config = loadConfig();
 

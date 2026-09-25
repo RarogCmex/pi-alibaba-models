@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.2
+
+A second installed copy of this plugin can no longer silently shadow the first.
+
+- **Duplicate-install guard.** Two configured copies (typically a local checkout *and* `npm:pi-alibaba-models`) both call `registerProvider("alibaba-cloud", …)`, and pi keeps whichever loads last — so the other's wire format, `maxTokens` and endpoint are replaced with no diagnostic. Observed 2026-09-25: a stale npm 1.1.1 overrode the 1.5.1 fork, `cloudApiFormat: "openai-responses"` was ignored, requests went to the Anthropic path at `maxTokens: 8192`, and pi's `max_tokens = thinking + answer` split left 1024 tokens for the answer — long replies ended mid-sentence with `stopReason: length` ("Response was truncated before completion"). The factory now scans every source pi itself loads (user/project `packages`, auto-discovered extension dirs, `-e` arguments), resolves each the way pi's `PackageManager` does (npm managed layout, git `host/path`, local relative to the agent dir or `<cwd>/.pi`), dedupes by real path, and refuses to start when another copy is present. pi reports a factory failure as a fatal startup diagnostic in every mode, so the session never begins half-broken. `PI_ALIBABA_ALLOW_DUPLICATE=1` bypasses the check. Sources are matched by `package.json` `name`, never by directory name, so renamed forks and unrelated packages are ignored; object-form entries with `autoload: false` are not counted.
+
 ## 1.5.1
 
 Replacing the Cloud API key re-derives the endpoint instead of inheriting the previous key's.
