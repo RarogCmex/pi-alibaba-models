@@ -108,3 +108,43 @@ the model unless activated explicitly» — то есть инструмент �
 - **Живых проб** — ни одна не запускалась в этой сессии: перечисленные выше проверки
   требуют ключа и разрешения, а измерение токенов декларации (пункт 1) делается
   офлайн и его можно сделать первым же шагом бесплатно.
+
+---
+
+## 3. Почему в этом репозитории появился `ChatModelConfig` (проверенная сторона хоста)
+
+Это не задача «сделать», а объяснение, чтобы следующий читатель не решил, что alias —
+самодеятельность автора. Проверено 2026-10-03 на **двух** установках pi 1.0.0
+(`~/.local` и nvm-префикс; `dist/index.d.ts` там побайтово одинаков), в том числе
+независимым прогоном субагента:
+
+- Три члена союза **объявлены и экспортированы** в
+  `pi-coding-agent/dist/core/extensions/types.d.ts` (`ProviderChatModelConfig`:
+  1441, `ProviderImageModelConfig`: 1459, `ProviderClassifierModelConfig`: 1465;
+  сам союз — 1471) и **продублированы** в `dist/core/provider-composer.d.ts`
+  (25/36/41/46). `ProviderModelConfigBase` при этом **не** экспортирован.
+- Публичная поверхность отдаёт только сам союз: `dist/core/extensions/index.d.ts:9`
+  и `dist/index.d.ts:8` перечисляют `ProviderConfig, ProviderModelConfig` — и **не**
+  членов. `grep ProviderChatModelConfig dist/index.d.ts` пусто.
+- Дотянуться до членов поддерживаемым спецификатором **нельзя**: `exports`-map
+  пакета содержит только `.`, `./rpc-entry` (без `types`), `./client` и
+  `./experimental/plugin` (оба — с одним лишь `source`-условием, то есть **не
+  резолвятся** вообще); любой `/dist/...` путь падает с
+  `ERR_PACKAGE_PATH_NOT_EXPORTED`. Практически это подтверждается и TS:
+  `error TS2724: '"@earendil-works/pi-coding-agent"' has no exported member named
+  'ProviderChatModelConfig'. Did you mean 'ProviderModelConfig'?`
+- Библиотеки рядом (`@earendil-works/pi-ai`, `pi-agent-core`, `pi-tui`, все 1.0.0)
+  не объявляют и не реэкспортируют эти типы. Хелперы сужения у хоста есть только для
+  **резолвнутых `Model`-объектов** (`isModelType`, `assertChatModel` из
+  `@earendil-works/pi-ai/utils/model-operations` — по поддерживаемому сабпасу, не с
+  корневого энтри), а для **конфиг-союза** — ни одного
+  (`grep -rEo '\b(is|assert)[A-Za-z]*ModelConfig\b' dist` → пусто).
+
+**Следствие:** единственные сегодня работающие варианты для автора расширения —
+объявить форму локально (как здесь) либо вырезать её из союза через
+`Extract<ProviderModelConfig, { type?: "chat" }>`; при этом второй способ ломает
+совместимость со старым хостом (на 0.87.0 у типа нет поля `type`, и `Extract`
+сворачивается в `never` — измерено, см. 1.5.3). Если хост однажды начнёт
+реэкспортировать членов из корня и/или отдаст `isChatModelConfig()` для конфигов,
+здешний alias можно будет схлопнуть в один импорт — и это будет заметно по
+единственному месту в файле.
