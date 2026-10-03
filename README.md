@@ -27,6 +27,8 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's
 
 > **Distribution status.** This repository is a **personal fork** (original: [Fornace/pi-alibaba-models](https://github.com/Fornace/pi-alibaba-models)), built for one's own use first. There is **no npm release line for this fork** — publishing under a personal npm name is a distant plan. `pi install pi-alibaba-models` / `pi install npm:pi-alibaba-models` resolve the **original, much older** npm package, not this fork. Install from git or a local checkout.
 
+> **Host versions.** Verified against pi **1.0.0** (2026-10-03): `tsc --noEmit` clean, 119/119 tests green, and `pi -ne -e <repo> --offline --list-models alibaba-cloud` registers the provider. The same source also typechecks and passes against the **0.87.0** host it was pinned to (both measured against a real 0.87.0 install), because the 1.0.0 fix is a type-level narrowing plus a chat-only read of pi's persisted snapshot — see `CHANGELOG.md` 1.5.3.
+
 ```bash
 # from this fork (recommended)
 pi install git:github.com/RarogCmex/pi-alibaba-models

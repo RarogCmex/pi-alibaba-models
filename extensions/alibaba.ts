@@ -1,4 +1,4 @@
-import { getAgentDir, type ExtensionAPI, type ProviderModelConfig, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ProviderModelConfig as PiModelConfig, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -18,6 +18,23 @@ import {
   type SidecarAction,
   type SidecarStrategy,
 } from "./sidecar.ts";
+
+// pi 1.0.0 turned the legacy `ProviderModelConfig` into a discriminated union
+// (chat | image | classifier). Chat-only fields — `compat`, `promptCache`,
+// `reasoning`, `contextWindow`, `maxTokens`, `thinkingLevelMap` — are no longer
+// readable through the union, and every entry this provider registers is a chat
+// model (DashScope serves no image or classifier operation through these
+// endpoints, and none is implemented here). So the catalog types work against
+// the chat member; `type` stays unset, which pi reads as "chat".
+//
+// Written as an exclusion, not as `Extract<…, { type?: "chat" }>`: on hosts
+// before 1.0.0 the config type has no `type` field at all, and `Extract` there
+// collapses to `never` (measured on the pinned 0.87.0 types in this tree).
+type ChatModelConfig = PiModelConfig extends infer M
+  ? M extends { type: "image" } | { type: "classifier" }
+    ? never
+    : M
+  : never;
 
 // ── Paths ─────────────────────────────────────────────────────────────
 // Resolve through pi's own getAgentDir() so a relocated config directory
@@ -336,15 +353,15 @@ function mergeCompat(
   base: object | undefined,
   tc: ThinkingConfig | undefined,
   openai: boolean,
-): ProviderModelConfig["compat"] {
+): ChatModelConfig["compat"] {
   return openai
     ? {
         ...(base ?? {}),
         ...(tc?.compat ?? {}),
         supportsDeveloperRole: false,
         supportsStore: false,
-      } as ProviderModelConfig["compat"]
-    : ((tc?.compat ?? base) as ProviderModelConfig["compat"]);
+      } as ChatModelConfig["compat"]
+    : ((tc?.compat ?? base) as ChatModelConfig["compat"]);
 }
 
 // Every card capability is derived from the id here (plus real catalog or
@@ -482,8 +499,8 @@ function capsFor(id: string): FamilyCaps {
 // `cacheWarming` setting decides off/streaming/idle). `long` stays unset —
 // there is no published 1h-class lifetime. The open-weight qwen3-<size>b line
 // has no caching at all and unknown families stay ineligible.
-const PROMPT_CACHE: NonNullable<ProviderModelConfig["promptCache"]> = { short: 300 };
-const promptCacheFor = (id: string): ProviderModelConfig["promptCache"] =>
+const PROMPT_CACHE: NonNullable<ChatModelConfig["promptCache"]> = { short: 300 };
+const promptCacheFor = (id: string): ChatModelConfig["promptCache"] =>
   capsFor(id).cache ? PROMPT_CACHE : undefined;
 
 const OPENAI_BASE_COMPAT = {
@@ -616,7 +633,7 @@ export function buildPlanModels(
   openaiUrl: string,
   anthropicUrl: string,
   overrides?: Record<string, number>,
-): ProviderModelConfig[] {
+): ChatModelConfig[] {
   return defs.map((m) => {
     const useOpenAI = !!m.openaiOnly || /deepseek/i.test(m.id);
     const api = (useOpenAI ? "openai-completions" : "anthropic-messages") as "anthropic-messages" | "openai-completions";
@@ -676,11 +693,11 @@ export function applyAuthorizedFilter<T extends { id: string }>(
   return { models: filtered, authorizedOnly: true };
 }
 
-async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<ProviderModelConfig[] | null> {
+async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<ChatModelConfig[] | null> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const models: ProviderModelConfig[] = [];
+    const models: ChatModelConfig[] = [];
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime|3d|face)/i;
     for (let page = 1; page <= 5; page++) {
       const params = new URLSearchParams({ capabilities: "TG", page_no: String(page), page_size: "100" });
@@ -726,7 +743,7 @@ async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<Provi
   } finally { clearTimeout(t); }
 }
 
-async function fetchCloudModelsCompat(domain: string, apiKey: string): Promise<ProviderModelConfig[]> {
+async function fetchCloudModelsCompat(domain: string, apiKey: string): Promise<ChatModelConfig[]> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 4000);
   try {
@@ -794,7 +811,7 @@ async function fetchCloudAuthorizedModels(domain: string, apiKey: string): Promi
   } finally { clearTimeout(t); }
 }
 
-async function fetchCloudModels(domain: string, apiKey: string, _force = false): Promise<{ models: ProviderModelConfig[]; authorizedOnly: boolean }> {
+async function fetchCloudModels(domain: string, apiKey: string, _force = false): Promise<{ models: ChatModelConfig[]; authorizedOnly: boolean }> {
   const v1 = await fetchCloudModelsV1(domain, apiKey);
   if (v1) {
     let models = v1;
@@ -893,12 +910,12 @@ export function countFallbackModels(models: { id: string }[], fmt: CloudApiForma
 }
 
 export function buildCloudModels(
-  models: ProviderModelConfig[],
+  models: ChatModelConfig[],
   domain: string,
   fmt: string,
   overrides?: Record<string, number>,
   sessionCache = true,
-): ProviderModelConfig[] {
+): ChatModelConfig[] {
   const format = (fmt as CloudApiFormat) || DEFAULT_CLOUD_FORMAT;
   return models.map((m) => {
     const api = resolveCloudApi(m.id, format);
@@ -1317,7 +1334,7 @@ async function ensureCloudEndpointBound(apiKey: string): Promise<void> {
 // fetched and replaces it. We use a real, region-agnostic id (`qwen-plus`,
 // present on every DashScope account) so it also works for an env-var user
 // before the first refresh, and never lingers as an orphan after login.
-const CLOUD_LOGIN_SEED: ProviderModelConfig[] = [{
+const CLOUD_LOGIN_SEED: ChatModelConfig[] = [{
   id: "qwen-plus",
   name: "Qwen Plus",
   reasoning: false,
@@ -1339,11 +1356,21 @@ type RefreshCtx = {
   allowNetwork: boolean;
   force?: boolean;
   signal?: AbortSignal;
-  stored?: { models?: readonly ProviderModelConfig[] };
+  // pi 1.0.0 persists one store entry per provider with models of *every*
+  // operation (`readonly AnyModel[]`), so the snapshot can carry image or
+  // classifier rows. Typed structurally: pi's store types are not re-exported
+  // to extensions, and only `id`/`type` are read here. `chatRows()` filters.
+  stored?: { models?: readonly { id?: string; type?: string }[] };
   // `any`: pi's ModelsPublication is not re-exported as a public type, and the
   // publication object is built here anyway (persist + checkedAt).
   publish?(publication: any): Promise<boolean>;
 };
+
+// Chat-only view of pi's stored snapshot (exported: tests/model-compat.test.ts pins it). An entry without `type` is chat (pi's
+// own rule), and a non-chat row has no reasoning/contextWindow/maxTokens to
+// re-derive, so dropping it is both the safe and the honest reading.
+export const chatRows = <T extends { type?: string }>(models: readonly T[] | undefined): T[] =>
+  (models ?? []).filter((m) => m.type === undefined || m.type === "chat");
 
 // Coordination for many pi instances sharing one agent dir: alibaba-config.json
 // is the shared, last-writer-wins record of "someone just fetched". While it is
@@ -1391,7 +1418,7 @@ const releaseCatalogLock = () => { try { fs.unlinkSync(CATALOG_LOCK_PATH); } cat
 interface CatalogCache {
   v: 2;
   plan?: { fetchedAt: number; models: PlanModelDef[] };
-  cloud?: { fetchedAt: number; models: ProviderModelConfig[] };
+  cloud?: { fetchedAt: number; models: ChatModelConfig[] };
 }
 
 // Pure parser and version guard in one: anything but v2 is ignored, so an old
@@ -1444,7 +1471,7 @@ async function loadPlanCatalog(force: boolean): Promise<CatalogResult<PlanModelD
   }
 }
 
-async function loadCloudCatalog(domain: string, apiKey: string, force: boolean): Promise<CatalogResult<ProviderModelConfig>> {
+async function loadCloudCatalog(domain: string, apiKey: string, force: boolean): Promise<CatalogResult<ChatModelConfig>> {
   const cfg = loadConfig();
   if (!force && catalogFresh(cfg.cloudFetchedAt)) return { defs: cloudDefs, fetched: false };
   if (!(await acquireCatalogLock(force ? 10_000 : 0))) return { defs: cloudDefs, fetched: false };
@@ -1469,14 +1496,14 @@ async function loadCloudCatalog(domain: string, apiKey: string, force: boolean):
 // builders (capabilities are re-derived from ids — see deriveCard); the
 // network phase fetches and lets pi persist the result. With no credential at
 // all we return no models, so "Reset all" cannot leave ghosts in pi's store.
-const planRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConfig[]> => {
+const planRefreshModels = async (context: RefreshCtx): Promise<ChatModelConfig[]> => {
   const creds = readAuth()["alibaba-plan"];
   if (!creds?.access) return [];
   const ep = resolvePlanEndpoints(creds);
   const overrides = loadConfig().contextWindowOverrides;
   if (!context.allowNetwork) {
     // Cache-only phase: re-derive pi's stored snapshot — never a store write.
-    if (!planDefs.length) planDefs = ((context.stored?.models ?? []) as unknown as PlanModelDef[]);
+    if (!planDefs.length) planDefs = (chatRows(context.stored?.models) as unknown as PlanModelDef[]);
     return buildPlanModels(planDefs, ep.openai, ep.anthropic, overrides);
   }
   const result = await loadPlanCatalog(!!context.force);
@@ -1491,7 +1518,7 @@ const planRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConf
   return built;
 };
 
-const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelConfig[]> => {
+const cloudRefreshModels = async (context: RefreshCtx): Promise<ChatModelConfig[]> => {
   const key = readCloudKey();
   // A key written since the last run re-derives the endpoint before any fetch;
   // the models returned below carry the rebuilt baseUrl, so pi heals in one pass.
@@ -1503,7 +1530,7 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelCon
   // phase; with no credential nothing is served at all ("Reset all" safety).
   const held = cloudDefs.length && cloudDefs !== CLOUD_LOGIN_SEED
     ? cloudDefs
-    : ((context.stored?.models ?? []) as unknown as ProviderModelConfig[]);
+    : (chatRows(context.stored?.models) as unknown as ChatModelConfig[]);
   if (!key) return buildCloudModels(CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
   if (!context.allowNetwork) {
     if (!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) cloudDefs = held;
@@ -1523,7 +1550,7 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<ProviderModelCon
 // Filled by the loaders above (registration baseline + refreshModels), and
 // read by modifyModels, /alibaba's Status/Rate-limits/Override menus.
 let planDefs: PlanModelDef[] = [];
-let cloudDefs: ProviderModelConfig[] = [];
+let cloudDefs: ChatModelConfig[] = [];
 
 // ── Migration ─────────────────────────────────────────────────────────
 const isPlanKey = (k: string) => k.startsWith("sk-sp-") || k.startsWith("sk-tok-");

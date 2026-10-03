@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.3
+
+Runs on pi 1.0.0 — the host's model-list type became a union, and this extension reads it as chat.
+
+- **Chat-only model config.** pi 1.0.0 turned `ProviderModelConfig` into a discriminated union (`chat | image | classifier`, `dist/core/provider-composer.d.ts`), so the chat-only fields this file reads — `compat`, `promptCache`, `maxTokens`, `reasoning`, `contextWindow` — are no longer reachable through the union: `npm run build` failed with 7 `TS2339`s (measured 2026-10-03 against pi 1.0.0 / pi-ai 1.0.0). Both providers register chat models only — DashScope serves no image or classifier operation on these endpoints and none is implemented here — so the catalog types are the chat member of that union. The narrowing is written as a distributive `extends infer` exclusion, **not** as `Extract<…, { type?: "chat" }>`: on a pre-1.0.0 host the config type has no `type` field at all and `Extract` collapses to `never` (measured against the 0.87.0 types this tree used to pin). No runtime effect: pi loads the `.ts` sources with Node's type stripping (pi 1.0.0 dropped `tsx`), which erases types.
+- **pi's persisted snapshot is read chat-only.** `ModelsStoreEntry.models` is `readonly AnyModel[]` in 1.0.0 — "persisted models of every type" — so the offline re-serve in `planRefreshModels`/`cloudRefreshModels` now drops rows whose `type` is neither absent nor `"chat"` (`chatRows()`) before re-deriving cards. A non-chat row has no `contextWindow`/`maxTokens` to re-derive, and re-registering one as a chat model would put a model in the picker that cannot stream.
+- **Host pin raised to `^1.0.0`** in `devDependencies`; `peerDependencies` stays `*` per pi's packaging guidance for host-provided modules.
+- **Coverage for the filter.** `chatRows` is exported and pinned by three tests in `tests/model-compat.test.ts` (chat kept, type-less kept — pi's own rule and every pre-1.0.0 snapshot — image and classifier dropped, missing snapshot reads as empty). Mutation control: replacing the filter body with `(models ?? [])` turns exactly that test red.
+- Measured on both hosts: `tsc --noEmit` clean and 119/119 tests green against pi **0.87.0** and against pi **1.0.0** (2026-10-03; 116 before these three tests); provider registration checked by loading under `pi -ne -e … --offline --list-models alibaba-cloud`.
+
 ## 1.5.2
 
 A second installed copy of this plugin can no longer silently shadow the first.

@@ -4,6 +4,7 @@ import {
   applyAuthorizedFilter,
   buildCloudModels,
   buildPlanModels,
+  chatRows,
   catalogFresh,
   countFallbackModels,
   formatQuota,
@@ -472,5 +473,29 @@ describe("1.5.0: Responses is the default Cloud format", () => {
     assert.equal(countFallbackModels([def("qwen3.7-plus"), def("kimi-k2.6")], "openai-responses"), 1);
     assert.equal(countFallbackModels([def("qwen3.7-plus"), def("kimi-k2.6")], "openai-completions"), 0);
     assert.equal(countFallbackModels([def("deepseek-v4-pro")], "anthropic-messages"), 1);
+  });
+});
+
+describe("chatRows — pi 1.0.0 stores every model type in one entry", () => {
+  // pi 1.0.0 widened ModelsStoreEntry.models to `readonly AnyModel[]`, so the
+  // offline re-serve can be handed an image or classifier row. Those have no
+  // contextWindow/maxTokens to re-derive, and buildCloudModels would register
+  // them as chat models that cannot stream. An absent `type` means chat — pi's
+  // own rule — so it is kept, which is also what a pre-1.0.0 snapshot looks like.
+  const row = (id: string, type?: string) => ({ id, ...(type ? { type } : {}) });
+
+  it("keeps chat rows and rows without a type", () => {
+    assert.deepEqual(chatRows([row("qwen3.7-max", "chat"), row("qwen-plus")]).map((r) => r.id),
+      ["qwen3.7-max", "qwen-plus"]);
+  });
+
+  it("drops image and classifier rows", () => {
+    assert.deepEqual(
+      chatRows([row("qwen-plus"), row("qwen-image", "image"), row("jev-latest", "classifier")]).map((r) => r.id),
+      ["qwen-plus"]);
+  });
+
+  it("treats a missing snapshot as empty", () => {
+    assert.deepEqual(chatRows(undefined), []);
   });
 });
