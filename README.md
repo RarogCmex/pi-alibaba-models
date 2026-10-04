@@ -8,7 +8,9 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's
 - **Three API Shapes**: OpenAI **Responses** (`/compatible-mode/v1/responses`) **by default since 1.5.0** (session-cache economics, agent-native features); OpenAI Chat Completions (`/compatible-mode/v1`) auto-selected for DeepSeek and for models without Responses support; Anthropic-compatible (`/v1/messages`) still selectable per-Cloud via `/alibaba`.
 - **Five+ Regions**: International (`dashscope-intl.aliyuncs.com`), China, US-Virginia, Hong Kong, plus Alibaba's recommended **workspace domains** `{WorkspaceId}.{region}.maas.aliyuncs.com` for Beijing / Singapore / Tokyo / Frankfurt / US — switch with `/alibaba`, no re-login needed. Shared regional domains are **auto-upgraded** to the matching workspace domain when the WorkspaceId is discoverable and the candidate passes a probe. Replacing the API key **re-derives the endpoint from scratch** — the default (shared) endpoint first, then the corporate upgrade — so a stale workspace domain can never 403 a new key.
 - **Native Reasoning**: First-class thinking-level support for every reasoning-capable model, including `reasoning.effort` on Responses and Completions effort maps for Qwen 3.8 / GLM-5.x / DeepSeek V4.
-- **DashScope sidecar tools** (opt-in): one Pi tool, `alibaba_tools`, for live web search, page extract, code interpreter, and image search. Off by default. Does not change the chat API format.
+- **DashScope sidecar tools**: one Pi tool, `alibaba_tools`, for live web search, page extract, code interpreter, and image search. Billed separately. Does not change the chat API format.
+- **Image generation** (Cloud): DashScope's `qwen-image-*`, `z-image-*`, and `wan*-image`/`wan*-t2i` families are registered as pi **image models**, reachable from `codemode` scripts through `models.generateImages()` **and** through a dedicated `alibaba_image` tool that carries every generation parameter. Also available without `codemode` via `/alibaba image <prompt>`. Plan accounts register no image models.
+- **Configurable tool exposure**: each Alibaba tool can be `codemode` (default), `direct`, `deferred`, or off. The default keeps tool declarations out of every request while surviving a reload and staying callable from scripts.
 - **Vision Capable**: Image input automatically enabled for VL models, Qwen 3.8, Qwen 3.x Plus variants, and Kimi.
 - **Live Catalog**: Cloud prefers Alibaba's native `GET /api/v1/models` (real context windows, max output, capability tags, pricing) and falls back to compatible-mode `/models`. Plan still uses the live `/compatible-mode/v1/models` list. New models appear as Alibaba ships them — no extension update needed.
 
@@ -27,7 +29,7 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's
 
 > **Distribution status.** This repository is a **personal fork** (original: [Fornace/pi-alibaba-models](https://github.com/Fornace/pi-alibaba-models)), built for one's own use first. There is **no npm release line for this fork** — publishing under a personal npm name is a distant plan. `pi install pi-alibaba-models` / `pi install npm:pi-alibaba-models` resolve the **original, much older** npm package, not this fork. Install from git or a local checkout.
 
-> **Host versions.** Verified against pi **1.0.0** (2026-10-03): `tsc --noEmit` clean, 119/119 tests green, and `pi -ne -e <repo> --offline --list-models alibaba-cloud` registers the provider. The same source also typechecks and passes against the **0.87.0** host it was pinned to (both measured against a real 0.87.0 install), because the 1.0.0 fix is a type-level narrowing plus a chat-only read of pi's persisted snapshot — see `CHANGELOG.md` 1.5.3.
+> **Host versions.** Requires pi **1.0.0 or newer** — the release uses the union-typed model list (image models), the tool `exposure` API, and `provider_stream_event` directly, and drops the pre-1.0.0 compatibility shim (ADR-0001). Verified against pi **1.0.0** (2026-10-03) and re-verified against **1.0.2** (2026-10-04): `tsc --noEmit` clean, tests green, and `pi -ne -e <repo> --offline --list-models alibaba-cloud` registers the provider. The 1.0.1/1.0.2 patch releases added no API break this extension relies on. 1.5.3 is the last line that runs on pre-1.0.0 hosts.
 
 ```bash
 # from this fork (recommended)
@@ -83,7 +85,7 @@ Plan is registered as an `oauth` provider (paste token in `/login`). Cloud is re
 - Anthropic-compat: `https://dashscope-intl.aliyuncs.com/apps/anthropic`
 - OpenAI-compat:    `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` (Chat Completions **and** Responses)
 
-> **OpenAI Responses API** (`/compatible-mode/v1/responses`): Alibaba's newest OpenAI-compatible surface, with `reasoning.effort` thinking levels. **Default since 1.5.0** — an unset format is pinned to it at first boot, and formats chosen explicitly are never touched. Built-in DashScope tools are **not** mixed into that chat stream (pi still sends its own agent tools). Enable them separately with `/alibaba → Cloud — DashScope built-in tools`: that registers `alibaba_tools`, which makes its own Cloud request (Responses, or Completions `enable_search` for a cheap search) using a Qwen model. DeepSeek stays on Chat Completions when the Cloud format is Anthropic (that path hangs); on Responses it follows the selected format (Beijing/Singapore per Alibaba's docs).
+> **OpenAI Responses API** (`/compatible-mode/v1/responses`): Alibaba's newest OpenAI-compatible surface, with `reasoning.effort` thinking levels. **Default since 1.5.0** — an unset format is pinned to it at first boot, and formats chosen explicitly are never touched. The sidecar is **not** mixed into that chat stream (pi still sends its own agent tools). Enable them separately with `/alibaba → Tools — Exposure → alibaba_tools → direct` (or `codemode` to keep the declaration out of every request): that registers `alibaba_tools`, which makes its own Cloud request (Responses, or Completions `enable_search` for a cheap search) using a Qwen model. DeepSeek stays on Chat Completions when the Cloud format is Anthropic (that path hangs); on Responses it follows the selected format (Beijing/Singapore per Alibaba's docs).
 
 ## Key prefix reference
 
@@ -159,6 +161,7 @@ The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, tex
 - **API Wrapper Quirks**: Alibaba's native Anthropic compatibility layer can occasionally be strict or quirky with complex parallel tool calls. If you experience systemic parsing errors on DashScope, switch Cloud API format to "OpenAI Chat Completions" or "OpenAI Responses".
 - **Responses API**: not every model supports every built-in DashScope tool, and `xhigh`/`max` effort are documented for Beijing/Singapore. If a model errors out, switch back to Chat Completions or Anthropic for that session.
 - **`alibaba_tools`**: Cloud key required (`/login` or `$DASHSCOPE_API_KEY`). Qwen only — 3.7 Max / 3.6 Plus+ search is Responses-only. Completions search does not return source URLs; Responses search/research can. Auto sidecar model prefers Flash/Plus over Max. Search usage is billed on the sidecar call. A silent hang should not happen: the tool card streams elapsed time and built-in calls. Sidecar 429s and transient `server_error` backend failures (`Backend buffer overflow`) retry inside the tool (user sees `429 / server_error, retrying…`; the model only gets the final result). If it still times out, narrow the task or raise `ALIBABA_SIDECAR_TIMEOUT_MS`.
+- **Image generation**: Cloud only; a Plan account registers no image models. DashScope bills **per image**, not per token, so the picker's cost figures do not cover image generation and image cards declare zero cost. pi's own `models.generateImages()` carries only a prompt and reference images — no `size`, `n`, `seed`, or prompt-extension switches — which is why `alibaba_image` and `/alibaba image` exist. A generation takes 6–57 s depending on the model. The returned URLs expire in 24 hours, so the extension downloads the bytes and returns image content; nothing is written to disk unless `save` (tool) or `--save` (command) is given.
 - **Output budget vs. thinking budget**: On the Anthropic path, `max_tokens` is a **total** budget shared between thinking and the final answer. pi splits the card's `maxTokens` accordingly, so a card value of 8192 leaves only 8192 − 7168 = **1024 tokens** for the actual answer at high thinking — enough to truncate large tool calls (e.g. big `write`/`edit` content) mid-arguments. The card therefore reports the model's own catalog `max_output_tokens` whenever the catalog has a row (clamped at 131072 — e.g. `qwen-plus` = 32768, which yields a 16384-token answer budget at high thinking). Models with **no** catalog row keep a conservative fallback (32768; 8192 for non-reasoning ids and the open-weight `qwen3-<size>b` line, measured at 8192), because overshooting the real ceiling is rejected outright with `Range of max_tokens should be [1, N]`. Completions and Responses keep the catalog's larger output ceilings.
 - **Dynamic Caching**: Model lists use the plan-C hybrid (private snapshot + pi's models store as a bonus channel; details above). If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists` (force — always fetches).
 - **Prompt caching & cache warming**: caching-capable families declare `promptCache: {short: 300}` (DashScope's documented 5-minute ephemeral window, renewed on a hit), which makes them eligible for pi 0.86+'s prompt-cache warming — the global `cacheWarming` setting (`off` / `streaming` / `idle`) decides when warming happens. No `long` tier is declared (none is published). The open-weight `qwen3-<size>b` line has no documented caching and is never warmed. On the Cloud **Responses** format each request additionally carries `x-dashscope-session-cache: enable` — DashScope's server-side session cache gives predictable multi-turn prefix hits (reads billed at ~10% instead of the implicit cache's 20–25%; cache writes at 125%; 5-min window renewed on hit). It is documented for the Responses endpoint only, so Completions/Anthropic requests stay unmarked. Because writes cost 125% of input, one-shot-heavy usage can switch the header off with `/alibaba → Cloud — Session Cache: On / Off` (`cloudSessionCache` in config); multi-turn agent sessions should keep it on.
@@ -176,13 +179,15 @@ The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, tex
 | Cloud — Change Domain        | International / China / US / HK / workspace domains / Custom             |
 | Cloud — Change API Format    | OpenAI Responses (default) / Anthropic Messages / OpenAI Chat Completions |
 | Cloud — Session Cache: On / Off | toggles `x-dashscope-session-cache` on Cloud Responses requests |
-| Cloud — DashScope built-in tools | Opt-in `alibaba_tools` sidecar (Qwen; research/search/code/image)   |
+| Tools — Exposure | Set `alibaba_tools` / `alibaba_image` to codemode (default), direct, deferred, or off |
+| Tools — Sidecar model | Pin the Qwen model `alibaba_tools` uses (blank = auto) |
+| Image — Default model | Pick the default DashScope image model for the tool and `/alibaba image` |
 | Rate limits (Cloud)          | Show per-model rate/usage quotas (`/api/v1/models/limits`)               |
 | Cloud — Authorized-only Filter | Toggle hiding catalog models the account isn't authorized to call      |
 | Context Window — Override    | Set the context-window shown on a model's card (per model, or `*` for all) |
 | Reset all                    | Wipe all Alibaba state (config, both auth entries, plan-models cache)    |
 
-Enable `alibaba_tools`, then ask the agent for live docs or news. Typical calls:
+Enable `alibaba_tools` (it defaults to `codemode` exposure), then ask the agent for live docs or news. Typical calls:
 
 ```text
 alibaba_tools({ action: "search", task: "Hangzhou weather tomorrow" })
@@ -190,6 +195,47 @@ alibaba_tools({ action: "research", task: "What changed in DashScope web_search 
 ```
 
 Default to **`search`**. `research` (search + extractor + interpreter, thinking on) is slower and only worth it when search was too thin. The sidecar **streams** into the tool card (heartbeat every 4s) so a long call is not a silent hang. Limits: 3 min for search/code/image, 8 min for research — override with `ALIBABA_SIDECAR_TIMEOUT_MS`. Chat format is unchanged.
+
+## Tool exposure
+
+Each Alibaba tool has its own exposure (`/alibaba → Tools — Exposure`), written to `alibabaToolsExposure` / `alibabaImageExposure`:
+
+| Exposure | Meaning |
+|---|---|
+| `codemode` (default) | Registered and callable from `codemode` scripts; **not** declared to the model on every turn, only listed in the `codemode` tool description under the `alibaba` namespace. A system-prompt line tells the model the tools exist. |
+| `direct` | Declared to the model on every turn (the old `alibaba_tools` behaviour). |
+| `deferred` | Reachable through `tool_search` instead of the `codemode` listing. |
+| `off` | Not registered at all; costs nothing and is unreachable. |
+
+Both tools share one namespace (`alibaba`) with longer `instructions` a script reads through `describeNamespace("alibaba")`. `alibaba_tools` is marked non-destructive; `alibaba_image` is marked destructive because `save` can overwrite a file. With both tools left at the default and `codemode` disabled in pi, neither is reachable — `/alibaba image <prompt>` is then the only Alibaba generation path.
+
+## Image generation
+
+Cloud keys register Alibaba's prompt-driven image models (`qwen-image-3.0-pro`, `qwen-image-3.0`, `qwen-image-max`, `qwen-image-plus`, `qwen-image`, `qwen-image-2.0`, `z-image-turbo`, `wan2.7-image-pro`, `wan2.6-t2i`, plus the `qwen-image-edit-*` editors) as pi **image models**. Vertical products (virtual try-on, face chains, word art) and third-party ids are never registered. Image models use the same Cloud key and Domain as chat.
+
+Three ways to use them:
+
+1. **From a `codemode` script** — pi's own API, prompt and reference images only:
+
+   ```js
+   // @options: {"timeout_ms": 300000}
+   const painter = await models.getModelOfType("image", "alibaba-cloud", "qwen-image-plus");
+   const result = await models.generateImages(painter, { input: [{ type: "text", text: "a red fox in the snow" }] });
+   if (result.stopReason !== "stop") return result.errorMessage;
+   for (const block of result.output) if (block.type === "image") image(block);
+   ```
+
+   pi's script API cannot carry generation parameters, so it uses each model's default size.
+2. **The `alibaba_image` tool** — every parameter DashScope accepts. Reachable directly (exposure `direct`) or from `codemode` (default):
+
+   ```text
+   alibaba_image({ task: "a red fox in the snow", model: "qwen-image-max", size: "1664*928", n: 2, seed: 7, save: "fox.png" })
+   ```
+
+   Parameters: `model`, `task` (prompt), `images` (0–3 local paths or `data:` URLs to edit; remote URLs are not supported), `size` (`<width>*<height>`), `n`, `seed`, `negative_prompt`, `watermark`, `prompt_extend`, `prompt_extend_mode` (`direct`/`agent`), `enable_thinking`, `save`. The result carries the image blocks to the model **and** as `structuredContent` to scripts. `save` is the only file-writing behaviour; without it nothing is written. With `n > 1` the first image goes to `save` and the rest get a numeric suffix (`fox-2.png`, `fox-3.png`).
+3. **Without `codemode`** — `/alibaba image <prompt> [--model id] [--size 1024*1024] [--n 2] [--seed 7] [--negative "…"] [--no-watermark] [--prompt-extend-mode agent] [--thinking] [--image ref.png] [--save out.png]`. It reports elapsed time while the model works (6–57 s is normal) and shows the result in the transcript.
+
+The default image model is set from `/alibaba → Image — Default model` (`imageModel` in config) and reported in `/alibaba → Status`. Generated URLs expire in 24 hours, so the extension downloads the bytes: what you see in the session is the image itself.
 
 ## Troubleshooting
 
@@ -201,7 +247,8 @@ Default to **`search`**. `research` (search + extractor + interpreter, thinking 
 - **`Error: server_error: Backend buffer overflow.`** → transient DashScope inference-backend failure, not a problem with your request. Chat auto-retries via pi (the extension marks bare variants retryable); `alibaba_tools` retries inside the tool card (`server_error, retrying n/3…`). If it keeps failing, wait a minute and resend, or switch model/region.
 - **`/alibaba` command doesn't appear** → `pi list` should show `pi-alibaba-models` (or whatever source you installed from) under "User packages". If absent, run `pi install pi-alibaba-models` again and restart `pi`.
 - **`pi-alibaba-models is installed 2 times; 1 of those would shadow this copy`** → two copies of this plugin are configured (most often a local checkout *and* `npm:pi-alibaba-models`), and `pi` refuses to start rather than let one silently override the other. Both copies register the same `alibaba-cloud` provider and pi keeps whichever loads last, so the other's wire format, `maxTokens` and endpoint are dropped without a word — long answers get truncated mid-sentence at 1024 output tokens. Run `pi remove <the copy named in the error>` (usually `pi remove npm:pi-alibaba-models`) and restart. `pi list` shows every configured copy; the npm- and git-installed manifests live in `~/.pi/agent/npm/node_modules/` and `~/.pi/agent/git/`. Set `PI_ALIBABA_ALLOW_DUPLICATE=1` to boot anyway (e.g. while deliberately comparing two versions).
-- **`alibaba_tools` missing** → it is off by default. `/alibaba → Cloud — DashScope built-in tools → Enable`, then `/reload` or restart. Needs a Cloud key.
+- **`alibaba_tools` missing** → its exposure is `off`. `/alibaba → Tools — Exposure → alibaba_tools → codemode` (or `direct`), then `/reload` or restart. Needs a Cloud key. With `codemode` disabled in pi, a `codemode`-exposed tool is registered but unreachable — choose `direct` instead.
+- **`alibaba_image` says the model is not registered** → Cloud image models are fetched only with a Cloud key. Run `/login → Alibaba Cloud (API Key)` (or set `$DASHSCOPE_API_KEY`), then `/alibaba → Refresh model lists`. Plan accounts never register image models.
 
 ## Files
 

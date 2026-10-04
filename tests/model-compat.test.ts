@@ -8,9 +8,12 @@ import {
   catalogFresh,
   countFallbackModels,
   formatQuota,
+  hostVersionSupported,
+  imageRows,
   inferAnthropicMaxTokens,
   isReasoningModel,
   isVisionModel,
+  ownedRows,
   parseApiV1Prices,
   parseCatalogCache,
   resolveCloudApi,
@@ -476,12 +479,50 @@ describe("1.5.0: Responses is the default Cloud format", () => {
   });
 });
 
-describe("chatRows — pi 1.0.0 stores every model type in one entry", () => {
+describe("host floor (ADR-0001)", () => {
+  it("accepts pi 1.0.0 and newer, rejects the pre-1.0.0 host", () => {
+    assert.equal(hostVersionSupported("1.0.0"), true);
+    assert.equal(hostVersionSupported("1.5.3"), true);
+    assert.equal(hostVersionSupported("2.4.1"), true);
+    assert.equal(hostVersionSupported("0.87.0"), false);
+  });
+
+  it("does not block on an unknown or unparseable version", () => {
+    assert.equal(hostVersionSupported(undefined), true);
+    assert.equal(hostVersionSupported(""), true);
+    assert.equal(hostVersionSupported("dev"), true);
+  });
+});
+
+describe("ownedRows — the Cloud provider owns chat and image rows, not classifiers", () => {
   // pi 1.0.0 widened ModelsStoreEntry.models to `readonly AnyModel[]`, so the
-  // offline re-serve can be handed an image or classifier row. Those have no
-  // contextWindow/maxTokens to re-derive, and buildCloudModels would register
-  // them as chat models that cannot stream. An absent `type` means chat — pi's
-  // own rule — so it is kept, which is also what a pre-1.0.0 snapshot looks like.
+  // offline re-serve can be handed an image or classifier row. The provider
+  // registers chat *and* image models, so both are kept; a classifier row has
+  // no implementation here and would register as a model that cannot run. An
+  // absent `type` means chat — pi's own rule — so it is kept, which is also
+  // what a pre-1.0.0 snapshot looks like.
+  const row = (id: string, type?: string) => ({ id, ...(type ? { type } : {}) });
+
+  it("keeps chat rows, rows without a type, and image rows", () => {
+    assert.deepEqual(
+      ownedRows([row("qwen3.7-max", "chat"), row("qwen-plus"), row("qwen-image-plus", "image")]).map((r) => r.id),
+      ["qwen3.7-max", "qwen-plus", "qwen-image-plus"],
+    );
+  });
+
+  it("drops classifier rows", () => {
+    assert.deepEqual(
+      ownedRows([row("qwen-plus"), row("qwen-image", "image"), row("jev-latest", "classifier")]).map((r) => r.id),
+      ["qwen-plus", "qwen-image"],
+    );
+  });
+
+  it("treats a missing snapshot as empty", () => {
+    assert.deepEqual(ownedRows(undefined), []);
+  });
+});
+
+describe("chatRows / imageRows — the Sidecar picker must stay chat-only", () => {
   const row = (id: string, type?: string) => ({ id, ...(type ? { type } : {}) });
 
   it("keeps chat rows and rows without a type", () => {
@@ -489,13 +530,18 @@ describe("chatRows — pi 1.0.0 stores every model type in one entry", () => {
       ["qwen3.7-max", "qwen-plus"]);
   });
 
-  it("drops image and classifier rows", () => {
+  it("drops image and classifier rows from the chat-only view", () => {
     assert.deepEqual(
       chatRows([row("qwen-plus"), row("qwen-image", "image"), row("jev-latest", "classifier")]).map((r) => r.id),
       ["qwen-plus"]);
+    assert.deepEqual(chatRows(undefined), []);
   });
 
-  it("treats a missing snapshot as empty", () => {
-    assert.deepEqual(chatRows(undefined), []);
+  it("keeps only image rows for the image builder", () => {
+    assert.deepEqual(
+      imageRows([row("qwen-plus"), row("qwen-image", "image"), row("qwen3.7-max", "chat")]).map((r) => r.id),
+      ["qwen-image"],
+    );
+    assert.deepEqual(imageRows(undefined), []);
   });
 });

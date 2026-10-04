@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.0.0
+
+**Requires pi 1.0.0 or newer.** Adds DashScope image models and a dedicated image tool, makes tool exposure configurable (default `codemode`, a behaviour change for `alibaba_tools`), classifies stream errors by structure, and drops the pre-1.0.0 compatibility shim. See `docs/adr/0001-drop-pre-1.0.0-hosts.md` and `docs/specs/2.0.0-pi-1.0-frontier.md`.
+
+### Breaking changes
+
+- **Host floor is pi 1.0.0.** The hand-written `ChatModelConfig` exclusion type is replaced by the chat member of pi's model-config union (`Extract<ProviderModelConfig, { type?: "chat" }>`), and the dual-host verification ritual is gone. On a pre-1.0.0 host the config type has no `type` discriminant, so image models have nowhere to live and `exposure` does not exist — 1.5.3 is the last line for those hosts. The floor is enforced at load (`hostVersionSupported(VERSION)` throws with a clear message); `peerDependencies` stays `*` per pi's packaging guidance for host-provided modules.
+- **`alibaba_tools` default exposure is now `codemode`, not `direct`.** The 1.5.x `cloudSidecarTools` boolean is replaced by `alibabaToolsExposure` / `alibabaImageExposure` with the vocabulary `codemode` (default) / `direct` / `deferred` / `off`; an explicit `cloudSidecarTools: false` migrates to `off`, and `cloudSidecarTools` itself is removed. With both tools left at the default and `codemode` disabled in pi, neither is reachable and the only Alibaba generation path is `/alibaba image <prompt>`.
+
+### Image models (Cloud)
+
+- DashScope's prompt-driven image families (`qwen-image-3.0-pro`, `qwen-image-3.0`, `qwen-image-max`, `qwen-image-plus`, `qwen-image`, `qwen-image-2.0`, `z-image-turbo`, `wan2.7-image-pro`, `wan2.6-t2i`, plus the `qwen-image-edit-*` editors) are registered as pi **image models** on the `alibaba-cloud` provider, in the same mixed `models` list as the chat cards (`custom-provider.md`: supplying `models` replaces every operation). They come from the Cloud Domain's native `/api/v1/models?capabilities=IG` listing — a **separate fetch** from the chat catalogue, which deliberately excludes image ids by pattern — filtered to that curated allow-list; vertical products and third-party ids are never registered. Each card declares its true input modalities (`["text"]` for generators, `["text", "image"]` for editors) and `output: ["image"]`, uses `api: "dashscope-images"`, and carries zero cost (DashScope bills per image, not per token). A new `cloudImages` section in the private catalog snapshot, plus the image rows of pi's persisted store (`ownedRows()`), keep image models registered on an offline start; the Sidecar's model picker still receives chat ids only (`chatRows()`). The Plan provider registers no image models.
+- **One synchronous endpoint** covers the curated list: `POST /api/v1/services/aigc/multimodal-generation/generation`. The response's `output.choices[0].message.content[]` carries `{ type: "image", image: <url> }`; the URL expires in 24 hours, so the implementation downloads the bytes and returns image blocks. Token usage is mapped when the model reports it and left unset otherwise.
+
+### `alibaba_image` tool and `/alibaba image`
+
+- **`alibaba_image`** takes `model`, `task` (prompt), `images` (0–3 local paths or `data:` URLs to edit), `size`, `n`, `seed`, `negative_prompt`, `watermark`, `prompt_extend`, `prompt_extend_mode`, `enable_thinking`, and `save`. It calls the model registry with the remaining parameters in `options.metadata` (the host forwards them unchanged), and returns the image blocks **twice**: `content` so a direct caller and the TUI see the image, and a declared `outputSchema`/`structuredContent` (`{ images, model, size?, usage? }`) because a codemode script receives only structured content from a nested call. A provider failure becomes an `isError` result with the structured detail, never an empty success. `save` is the only file write; omitted means nothing is written. Annotations: `readOnlyHint: false`, `openWorldHint: true`, `idempotentHint: false`, `destructiveHint: true` (`save` can overwrite).
+- **`/alibaba image <prompt> [flags]`** is the no-codemode path (prompt plus the same parameters) and works with a Cloud key and `codemode` off. It reports elapsed seconds while the model works (6–57 s measured) and emits the result as a custom message carrying image content.
+
+### Tool exposure
+
+- Both tools default to `codemode` exposure and share one namespace `alibaba` with longer `instructions` a script reads through `describeNamespace("alibaba")`. The Sidecar's result gains a declared `outputSchema` and matching `structuredContent` (`{ action, result, sources, calls, retries }`). A `before_agent_start` section — present only while at least one tool is codemode-exposed — tells the model which tools scripts can call and to prefer `qwen-image-*`. The recommended image family carries a `(recommended)` marker in its display name.
+
+### Stream-error classification
+
+- A `provider_stream_event` handler records the raw parsed event per provider/model and classifies it by structure (HTTP 429, throttling/rate-limit phrasings, 5xx, `Backend buffer overflow`) rather than by the finished message's wording; it is notification-only, so `message_end` still enters pi through the finalized assistant message. The wording-based matchers stay as the fallback for turns where no raw event was seen, and an `InternalError.Algo.InvalidParameter` is never classed retryable.
+
+### Configuration and state
+
+- New config keys: `imageModel` (default image model) and `alibabaToolsExposure` / `alibabaImageExposure`; all live in `alibaba-config.json`, are written atomically, and are cleared by `/alibaba → Reset all`. `/alibaba → Status` reports the chat and image model counts, the default image model, and both exposures. `/alibaba → Tools — Exposure` sets each tool; `/alibaba → Image — Default model` sets the default image model.
+- Tests: the pure image surface (catalogue parser, curated filter, card builder, request-body builder, response parser, tool mapping, command parser), the stream-error classifier, the ownership/chat/image snapshot views, and the factory boot (registration, exposure, namespace, annotations, outputSchema, the prompt section, and the image tool's metadata mapping, structured content, `save` on/off, and error results).
+
 ## 1.5.3
 
 Runs on pi 1.0.0 — the host's model-list type became a union, and this extension reads it as chat.
@@ -8,7 +40,7 @@ Runs on pi 1.0.0 — the host's model-list type became a union, and this extensi
 - **pi's persisted snapshot is read chat-only.** `ModelsStoreEntry.models` is `readonly AnyModel[]` in 1.0.0 — "persisted models of every type" — so the offline re-serve in `planRefreshModels`/`cloudRefreshModels` now drops rows whose `type` is neither absent nor `"chat"` (`chatRows()`) before re-deriving cards. A non-chat row has no `contextWindow`/`maxTokens` to re-derive, and re-registering one as a chat model would put a model in the picker that cannot stream.
 - **Host pin raised to `^1.0.0`** in `devDependencies`; `peerDependencies` stays `*` per pi's packaging guidance for host-provided modules.
 - **Coverage for the filter.** `chatRows` is exported and pinned by three tests in `tests/model-compat.test.ts` (chat kept, type-less kept — pi's own rule and every pre-1.0.0 snapshot — image and classifier dropped, missing snapshot reads as empty). Mutation control: replacing the filter body with `(models ?? [])` turns exactly that test red.
-- Measured on both hosts: `tsc --noEmit` clean and 119/119 tests green against pi **0.87.0** and against pi **1.0.0** (2026-10-03; 116 before these three tests); provider registration checked by loading under `pi -ne -e … --offline --list-models alibaba-cloud`.
+- Measured against pi **1.0.0**: `tsc --noEmit` clean and 119/119 tests green (2026-10-03; 116 before these three tests); provider registration checked by loading under `pi -ne -e … --offline --list-models alibaba-cloud`. (Before this release the same source also ran on 0.87.0; 2.0.0 drops that host — see the 2.0.0 section.)
 
 ## 1.5.2
 

@@ -1,9 +1,28 @@
-import { getAgentDir, type ExtensionAPI, type ProviderModelConfig as PiModelConfig, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ProviderModelConfig as PiModelConfig, type ExtensionCommandContext, VERSION } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { assertSingleInstall, findPackageRoot } from "./duplicate-guard.ts";
+import {
+  buildImageModels,
+  DEFAULT_IMAGE_MODEL,
+  filterCuratedImageModels,
+  generateDashScopeImages,
+  IMAGE_API,
+  parseImageCatalog,
+  type ImageCatalogRow,
+} from "./image.ts";
+import { registerImageTool, runImageCommand, type ImageToolDeps } from "./image-tool.ts";
+import {
+  ALIBABA_NAMESPACE,
+  ALIBABA_TOOLS_ANNOTATIONS,
+  ALIBABA_TOOLS_OUTPUT_SCHEMA,
+  type RegisterToolDef,
+  type ToolResult,
+  type ToolUpdate,
+} from "./tool-presentation.ts";
+import { classifyStreamError, rewriteFromStreamError, type StreamErrorClass } from "./stream-errors.ts";
 import {
   ALIBABA_TOOLS_PARAMETERS,
   buildSidecarRequest,
@@ -21,20 +40,12 @@ import {
 
 // pi 1.0.0 turned the legacy `ProviderModelConfig` into a discriminated union
 // (chat | image | classifier). Chat-only fields — `compat`, `promptCache`,
-// `reasoning`, `contextWindow`, `maxTokens`, `thinkingLevelMap` — are no longer
-// readable through the union, and every entry this provider registers is a chat
-// model (DashScope serves no image or classifier operation through these
-// endpoints, and none is implemented here). So the catalog types work against
-// the chat member; `type` stays unset, which pi reads as "chat".
-//
-// Written as an exclusion, not as `Extract<…, { type?: "chat" }>`: on hosts
-// before 1.0.0 the config type has no `type` field at all, and `Extract` there
-// collapses to `never` (measured on the pinned 0.87.0 types in this tree).
-type ChatModelConfig = PiModelConfig extends infer M
-  ? M extends { type: "image" } | { type: "classifier" }
-    ? never
-    : M
-  : never;
+// `reasoning`, `contextWindow`, `maxTokens`, `thinkingLevelMap` — are reachable
+// only through the chat member, so the catalog types work against it; `type`
+// stays unset, which pi reads as "chat". Image entries use the union's image
+// member (`ImageModelConfig` in image.ts). The host floor is pi 1.0.0 (ADR-0001),
+// so `Extract` is safe — the pre-1.0.0 exclusion this replaced is gone.
+type ChatModelConfig = Extract<PiModelConfig, { type?: "chat" }>;
 
 // ── Paths ─────────────────────────────────────────────────────────────
 // Resolve through pi's own getAgentDir() so a relocated config directory
@@ -160,11 +171,19 @@ interface AlibabaConfig {
   // that endpoint is reachable. Set to false to always show the full catalog.
   cloudAuthorizedOnly?: boolean;
   // Opt-in Pi tool `alibaba_tools`: a sidecar POST to DashScope built-in
-  // tools (web_search / extractor / interpreter). Off by default so it
-  // does not inflate every session or bill search on DeepSeek/Kimi/GLM.
+  // tools (web_search / extractor / interpreter). Legacy boolean replaced by
+  // `alibabaToolsExposure`; read once at boot to migrate (false → "off").
   cloudSidecarTools?: boolean;
   // Optional Cloud model id for the sidecar (Qwen only). Empty = pick from catalog.
   cloudSidecarModel?: string;
+  // How `alibaba_tools` is exposed to the model. Default "codemode" (callable
+  // from codemode scripts, not declared every turn); "off" means not registered.
+  alibabaToolsExposure?: AlibabaToolExposure;
+  // How `alibaba_image` is exposed. Default "codemode"; "off" disables it.
+  alibabaImageExposure?: AlibabaToolExposure;
+  // Default DashScope image model for `alibaba_image` and the `/alibaba image`
+  // subcommand. Empty = pick the recommended family present in the catalog.
+  imageModel?: string;
   // Auto-upgrade a shared regional Cloud domain (dashscope.aliyuncs.com,
   // dashscope-intl…, dashscope-us…) to Alibaba's recommended workspace domain
   // {WorkspaceId}.{region}.maas.aliyuncs.com once the WorkspaceId has been
@@ -186,6 +205,62 @@ interface AlibabaConfig {
   planFetchedAt?: number;
   cloudFetchedAt?: number;
   cloudAuthorizedFilteredLast?: boolean;
+}
+
+// How one of the two Alibaba tools is exposed to the model. `codemode` is the
+// default: callable from codemode scripts and listed there, but not declared
+// on every request. `off` means the tool is not registered at all.
+export type AlibabaToolExposure = "codemode" | "direct" | "deferred" | "off";
+
+const TOOL_EXPOSURES: AlibabaToolExposure[] = ["codemode", "direct", "deferred", "off"];
+
+// The single human-facing label per exposure, shared by every menu that sets
+// one (no second list to keep in step with TOOL_EXPOSURES).
+export const TOOL_EXPOSURE_LABELS: Record<AlibabaToolExposure, string> = {
+  codemode: "codemode — callable from scripts, not declared every turn (default)",
+  direct: "direct — declared to the model on every turn",
+  deferred: "deferred — reachable through tool search",
+  off: "off — not registered, costs nothing",
+};
+
+// pi 1.0.0 is the host floor (ADR-0001): the model-config union, tool
+// `exposure`, and `provider_stream_event` this release relies on do not exist
+// before it. Pi's packaging guidance keeps `peerDependencies` at `*`, so the
+// floor is enforced here instead of only documented.
+export function hostVersionSupported(version: string | undefined): boolean {
+  if (!version) return true; // unknown version: do not block
+  const major = version.match(/^(\d+)\./)?.[1];
+  return major === undefined ? true : Number(major) >= 1;
+}
+
+export function isToolExposure(v: unknown): v is AlibabaToolExposure {
+  return typeof v === "string" && (TOOL_EXPOSURES as string[]).includes(v);
+}
+
+// The two tools' effective exposure: an unknown/missing value is the default
+// `codemode` (registered, callable from codemode scripts, not declared every
+// turn). `off` is the only value that skips registration.
+export function resolveToolsExposure(cfg: AlibabaConfig): AlibabaToolExposure {
+  return isToolExposure(cfg.alibabaToolsExposure) ? cfg.alibabaToolsExposure : "codemode";
+}
+export function resolveImageExposure(cfg: AlibabaConfig): AlibabaToolExposure {
+  return isToolExposure(cfg.alibabaImageExposure) ? cfg.alibabaImageExposure : "codemode";
+}
+
+// The 1.5.x `cloudSidecarTools` boolean is replaced by the exposure vocabulary:
+// an explicit `false` (the old opt-out) becomes `off`, and the legacy key is
+// dropped. Returns true when it changed the config, so the caller can persist.
+export function migrateToolExposure(cfg: AlibabaConfig): boolean {
+  let dirty = false;
+  if (cfg.alibabaToolsExposure === undefined && cfg.cloudSidecarTools === false) {
+    cfg.alibabaToolsExposure = "off";
+    dirty = true;
+  }
+  if (cfg.cloudSidecarTools !== undefined) {
+    delete cfg.cloudSidecarTools;
+    dirty = true;
+  }
+  return dirty;
 }
 
 const readJSON = <T>(p: string, fallback: T): T => {
@@ -827,6 +902,34 @@ async function fetchCloudModels(domain: string, apiKey: string, _force = false):
   return { models: await fetchCloudModelsCompat(domain, apiKey), authorizedOnly: false };
 }
 
+// A separate fetch from the chat catalogue: the chat fetch deliberately
+// excludes image ids by pattern and the Sidecar's model picker must keep
+// receiving chat ids only. `capabilities=IG` is the same endpoint and auth the
+// chat catalogue uses; the curated filter runs where the cards are built.
+async function fetchCloudImageModels(domain: string, apiKey: string): Promise<ImageCatalogRow[] | null> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const rows: ImageCatalogRow[] = [];
+    for (let page = 1; page <= 5; page++) {
+      const params = new URLSearchParams({ capabilities: "IG", page_no: String(page), page_size: "100" });
+      const res = await fetch(`https://${domain}/api/v1/models?${params}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return null;
+      const json = (await res.json()) as { output?: { total?: number } };
+      const pageRows = parseImageCatalog(json);
+      if (!pageRows.length) break;
+      rows.push(...pageRows);
+      if (rows.length >= (json.output?.total ?? 0) || pageRows.length < 100) break;
+    }
+    return rows.length ? rows : null;
+  } catch {
+    return null;
+  } finally { clearTimeout(t); }
+}
+
 interface ApiV1QuotaLimit {
   request_limit?: number | null;
   request_limit_period?: number | null;
@@ -1359,18 +1462,32 @@ type RefreshCtx = {
   // pi 1.0.0 persists one store entry per provider with models of *every*
   // operation (`readonly AnyModel[]`), so the snapshot can carry image or
   // classifier rows. Typed structurally: pi's store types are not re-exported
-  // to extensions, and only `id`/`type` are read here. `chatRows()` filters.
+  // to extensions, and only `id`/`type` are read here. `ownedRows()` filters.
   stored?: { models?: readonly { id?: string; type?: string }[] };
   // `any`: pi's ModelsPublication is not re-exported as a public type, and the
   // publication object is built here anyway (persist + checkedAt).
   publish?(publication: any): Promise<boolean>;
 };
 
-// Chat-only view of pi's stored snapshot (exported: tests/model-compat.test.ts pins it). An entry without `type` is chat (pi's
-// own rule), and a non-chat row has no reasoning/contextWindow/maxTokens to
-// re-derive, so dropping it is both the safe and the honest reading.
+// Ownership filter for pi's stored snapshot. A Cloud entry owns every row of
+// every operation this provider registers — chat and image — and only
+// classifier rows (which have no implementation here) are dropped. An entry
+// without `type` is chat (pi's own rule, and what every pre-1.0.0 snapshot
+// looks like). The image rows are kept so an offline start still registers
+// image models.
+export const ownedRows = <T extends { type?: string }>(models: readonly T[] | undefined): T[] =>
+  (models ?? []).filter((m) => m.type === undefined || m.type === "chat" || m.type === "image");
+
+// Chat-only view of pi's stored snapshot. The Sidecar's model picker, the
+// fallback-model count, and chat card derivation must never see an image id,
+// so this is the narrow view they use. (Exported: tests pin both views.)
 export const chatRows = <T extends { type?: string }>(models: readonly T[] | undefined): T[] =>
   (models ?? []).filter((m) => m.type === undefined || m.type === "chat");
+
+// Image rows of pi's stored snapshot, so `cloudRefreshModels` can re-serve
+// them in the cache-only phase.
+export const imageRows = <T extends { type?: string }>(models: readonly T[] | undefined): T[] =>
+  (models ?? []).filter((m) => m.type === "image");
 
 // Coordination for many pi instances sharing one agent dir: alibaba-config.json
 // is the shared, last-writer-wins record of "someone just fetched". While it is
@@ -1419,6 +1536,9 @@ interface CatalogCache {
   v: 2;
   plan?: { fetchedAt: number; models: PlanModelDef[] };
   cloud?: { fetchedAt: number; models: ChatModelConfig[] };
+  // Curated image rows (the native IG listing, already filtered). Optional:
+  // an older v2 snapshot without them is still valid, just image-less offline.
+  cloudImages?: { fetchedAt: number; models: ImageCatalogRow[] };
 }
 
 // Pure parser and version guard in one: anything but v2 is ignored, so an old
@@ -1444,6 +1564,13 @@ function seedFromSnapshot() {
   if (!planDefs.length && cache?.plan?.models?.length) planDefs = cache.plan.models;
   if ((!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) && cache?.cloud?.models?.length) {
     cloudDefs = cache.cloud.models;
+  }
+  // Presence of the `cloudImages` section counts as "already fetched", even when
+  // the curated filter emptied it — otherwise an account with no image models
+  // would force-refetch the IG listing on every boot.
+  if (cache?.cloudImages && !cloudImagesLoaded) {
+    cloudImageDefs = cache.cloudImages.models ?? [];
+    cloudImagesLoaded = true;
   }
 }
 
@@ -1479,10 +1606,30 @@ async function loadCloudCatalog(domain: string, apiKey: string, force: boolean):
     const { models, authorizedOnly } = await fetchCloudModels(domain, apiKey, force);
     const defs = models.length ? models : CLOUD_LOGIN_SEED;
     cloudDefs = defs;
+    // The image catalogue is a separate fetch (the chat one excludes image ids
+    // by pattern). A failed image fetch keeps whatever we already hold and
+    // never fails the chat catalogue with it.
+    let imageFetched = false;
+    try {
+      const rawImages = await fetchCloudImageModels(domain, apiKey);
+      if (rawImages) {
+        cloudImageDefs = filterCuratedImageModels(rawImages);
+        imageFetched = true;
+      }
+    } catch (e: any) {
+      console.warn(`[alibaba] Cloud image catalog fetch failed (${e?.message || e}); keeping ${cloudImageDefs.length} previously loaded image models.`);
+    } finally {
+      // One attempt per catalog fetch, success or not: a domain that never
+      // serves the IG listing must not make every boot force-refetch.
+      cloudImagesLoaded = true;
+    }
     cfg.cloudFetchedAt = Date.now();
     cfg.cloudAuthorizedFilteredLast = authorizedOnly;
     saveConfig(cfg);
-    if (models.length) updateCatalogCache({ cloud: { fetchedAt: cfg.cloudFetchedAt, models } });
+    const patch: Partial<CatalogCache> = {};
+    if (models.length) patch.cloud = { fetchedAt: cfg.cloudFetchedAt, models };
+    if (imageFetched) patch.cloudImages = { fetchedAt: cfg.cloudFetchedAt, models: cloudImageDefs };
+    if (Object.keys(patch).length) updateCatalogCache(patch);
     return { defs, fetched: models.length > 0 };
   } catch (e: any) {
     console.warn(`[alibaba] Cloud catalog fetch failed (${e?.message || e}); keeping ${cloudDefs.length} previously loaded models.`);
@@ -1490,6 +1637,28 @@ async function loadCloudCatalog(domain: string, apiKey: string, force: boolean):
   } finally {
     releaseCatalogLock();
   }
+}
+
+// Register-time model list: chat cards first, then the image cards. Supplying
+// `models` replaces the provider's models across every operation, so the two
+// builders merge here and the provider registers one mixed list. The four
+// build knobs travel as one object instead of four positional params.
+interface CloudBuildOptions {
+  domain: string;
+  fmt: string;
+  overrides?: Record<string, number>;
+  sessionCache?: boolean;
+}
+
+function buildCloudModelList(
+  chat: ChatModelConfig[],
+  images: ImageCatalogRow[],
+  opts: CloudBuildOptions,
+): PiModelConfig[] {
+  return [
+    ...buildCloudModels(chat, opts.domain, opts.fmt, opts.overrides, opts.sessionCache ?? true),
+    ...buildImageModels(images, opts.domain),
+  ];
 }
 
 // What pi calls. The offline phase re-serves the stored snapshot through the
@@ -1518,7 +1687,7 @@ const planRefreshModels = async (context: RefreshCtx): Promise<ChatModelConfig[]
   return built;
 };
 
-const cloudRefreshModels = async (context: RefreshCtx): Promise<ChatModelConfig[]> => {
+const cloudRefreshModels = async (context: RefreshCtx): Promise<PiModelConfig[]> => {
   const key = readCloudKey();
   // A key written since the last run re-derives the endpoint before any fetch;
   // the models returned below carry the rebuilt baseUrl, so pi heals in one pass.
@@ -1528,16 +1697,28 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<ChatModelConfig[
   const fmt = cfg.cloudApiFormat || DEFAULT_CLOUD_FORMAT;
   // The login seed must never shadow pi's stored snapshot in the cache-only
   // phase; with no credential nothing is served at all ("Reset all" safety).
+  // The ownership filter keeps chat *and* image rows and drops only classifier
+  // rows; the chat-only view then feeds the chat builder and the Sidecar picker.
+  const owned = ownedRows(context.stored?.models);
   const held = cloudDefs.length && cloudDefs !== CLOUD_LOGIN_SEED
     ? cloudDefs
-    : (chatRows(context.stored?.models) as unknown as ChatModelConfig[]);
+    : (chatRows(owned) as unknown as ChatModelConfig[]);
+  const heldImages = cloudImageDefs.length
+    ? cloudImageDefs
+    : (imageRows(owned) as unknown as ImageCatalogRow[]);
+  const buildOptions: CloudBuildOptions = {
+    domain, fmt,
+    overrides: cfg.contextWindowOverrides,
+    sessionCache: cfg.cloudSessionCache !== false,
+  };
   if (!key) return buildCloudModels(CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
   if (!context.allowNetwork) {
     if (!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) cloudDefs = held;
-    return buildCloudModels(held.length ? held : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
+    if (!cloudImageDefs.length) cloudImageDefs = heldImages;
+    return buildCloudModelList(held.length ? held : CLOUD_LOGIN_SEED, heldImages, buildOptions);
   }
   const result = await loadCloudCatalog(domain, key, !!context.force);
-  const built = buildCloudModels(result.defs.length ? result.defs : CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
+  const built = buildCloudModelList(result.defs.length ? result.defs : CLOUD_LOGIN_SEED, cloudImageDefs, buildOptions);
   // One store write per real fetch (see planRefreshModels), with the same
   // catch-up when the bonus channel is empty.
   if (result.defs.length && result.defs !== CLOUD_LOGIN_SEED && (result.fetched || !context.stored?.models?.length)) {
@@ -1548,9 +1729,15 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<ChatModelConfig[
 
 // ── Module-level mutable model lists ─────────────────────────────────
 // Filled by the loaders above (registration baseline + refreshModels), and
-// read by modifyModels, /alibaba's Status/Rate-limits/Override menus.
+// read by modifyModels, /alibaba's Status/Rate-limits/Override menus. Chat
+// and image definitions stay separate: `cloudDefs` is the only input to the
+// Sidecar picker, the fallback count, and chat card derivation.
 let planDefs: PlanModelDef[] = [];
 let cloudDefs: ChatModelConfig[] = [];
+let cloudImageDefs: ImageCatalogRow[] = [];
+// True once the image catalogue was either fetched or read from a snapshot that
+// carried a `cloudImages` section (empty counts — see seedFromSnapshot).
+let cloudImagesLoaded = false;
 
 // ── Migration ─────────────────────────────────────────────────────────
 const isPlanKey = (k: string) => k.startsWith("sk-sp-") || k.startsWith("sk-tok-");
@@ -1703,9 +1890,129 @@ function registerCloudProvider(pi: ExtensionAPI) {
     apiKey: "$DASHSCOPE_API_KEY",
     api: transport.api,
     authHeader: true,
-    models: buildCloudModels(cloudDefs, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false),
+    // One mixed list: supplying `models` replaces this provider's models across
+    // chat, image, and classifier operations, so the image cards must ride here
+    // or they would erase the chat models (custom-provider.md).
+    models: buildCloudModelList(cloudDefs, cloudImageDefs, {
+      domain, fmt,
+      overrides: cfg.contextWindowOverrides,
+      sessionCache: cfg.cloudSessionCache !== false,
+    }),
+    // Keyed by the `api` the image cards declare; pi forwards the resolved
+    // Cloud key and the tool's `metadata` here unchanged.
+    images: { [IMAGE_API]: { generateImages: generateDashScopeImages } },
     refreshModels: cloudRefreshModels,
   });
+}
+
+// Both tools share one namespace and one exposure vocabulary. A tool is only
+// registered while its exposure is not `off`; `codemode` (the default) keeps
+// the declaration out of every request while leaving it callable from scripts.
+function registerAlibabaTools(pi: ExtensionAPI, cfg: AlibabaConfig, imageDeps: ImageToolDeps) {
+  const toolsExposure = resolveToolsExposure(cfg);
+  const imageExposure = resolveImageExposure(cfg);
+
+  if (toolsExposure !== "off") {
+    pi.registerTool({
+      name: "alibaba_tools",
+      label: "Alibaba tools",
+      description:
+        "Separate billed Qwen sidecar for current web information, page extraction, " +
+        "sandbox computation, or image search. Not for local files or shell commands.",
+      promptSnippet:
+        "alibaba_tools: billed Qwen sidecar; search=current facts, research=pages/multi-source, " +
+        "code=sandbox, image=pictures.",
+      promptGuidelines: [
+        "Use only when current external information or a DashScope sandbox is needed; skip local/repository work and equivalent results already available from another tool.",
+        "Use search for quick lookups. Use research directly for page extraction or multi-source synthesis, or when search is insufficient; research is slower and costlier.",
+      ],
+      parameters: ALIBABA_TOOLS_PARAMETERS,
+      executionMode: "parallel",
+      exposure: toolsExposure,
+      namespace: ALIBABA_NAMESPACE,
+      annotations: ALIBABA_TOOLS_ANNOTATIONS,
+      outputSchema: ALIBABA_TOOLS_OUTPUT_SCHEMA,
+      async execute(
+        _toolCallId: string,
+        rawParams: { action?: string; task?: string; strategy?: SidecarStrategy },
+        signal: AbortSignal | undefined,
+        onUpdate: ToolUpdate,
+      ): Promise<ToolResult> {
+        const params = rawParams as { action?: string; task?: string; strategy?: SidecarStrategy };
+        const action = String(params.action || "search") as SidecarAction;
+        const task = typeof params.task === "string" ? params.task.trim() : "";
+        const strategy = params.strategy;
+        if (!task) throw new Error("alibaba_tools requires a non-empty task.");
+        if (!["research", "search", "code", "image"].includes(action)) {
+          throw new Error(`Unknown action "${action}". Use search, research, code, or image.`);
+        }
+        const key = readCloudKey();
+        if (!key) {
+          throw new Error("No Cloud API key. Run /login → Alibaba Cloud (API Key) or set $DASHSCOPE_API_KEY.");
+        }
+        await ensureCloudEndpointBound(key);
+        const live = loadConfig();
+        const domain = live.cloudDomain || DEFAULT_CLOUD_DOMAIN;
+        const picked = pickSidecarModel({
+          preferred: live.cloudSidecarModel,
+          catalogIds: cloudDefs.map((m) => m.id),
+          action,
+        });
+        if ("error" in picked) throw new Error(picked.error);
+        const req = buildSidecarRequest({
+          model: picked.id,
+          transport: picked.transport,
+          action,
+          task,
+          strategy,
+        });
+        onUpdate?.({
+          content: [{ type: "text", text: formatSidecarProgress(action, 0, { text: "", sources: [], calls: [] }) }],
+          details: { action, model: picked.id, transport: picked.transport, partial: true },
+        });
+        const res = await runSidecarWithRetry(domain, key, req, signal, (parsed, elapsedMs) => {
+          onUpdate?.({
+            content: [{ type: "text", text: formatSidecarProgress(action, elapsedMs, parsed) }],
+            details: { action, model: picked.id, transport: picked.transport, partial: true, calls: parsed.calls },
+          });
+        }, {
+          onRetry: ({ attempt, maxAttempts, delayMs, reason }) => {
+            onUpdate?.({
+              content: [{ type: "text", text: formatSidecarRetry(action, attempt, maxAttempts, delayMs, reason) }],
+              details: { action, model: picked.id, transport: picked.transport, partial: true, retry: attempt, maxAttempts },
+            });
+          },
+        });
+        if (!res.ok) throw new Error(dashScopeErrorMessage(res.status, res.json));
+        return {
+          content: [{ type: "text", text: formatSidecarResult(res.parsed) }],
+          structuredContent: {
+            action,
+            result: res.parsed.text,
+            sources: res.parsed.sources.map((s) => {
+              const out: Record<string, string> = {};
+              if (s.url) out.url = s.url;
+              if (s.title) out.title = s.title;
+              if (s.snippet) out.snippet = s.snippet;
+              return out;
+            }),
+            calls: res.parsed.calls,
+            retries: res.retries,
+          },
+          details: {
+            action,
+            model: picked.id,
+            transport: picked.transport,
+            calls: res.parsed.calls,
+            sourceCount: res.parsed.sources.length,
+            retries: res.retries,
+          },
+        };
+      },
+    } as RegisterToolDef);
+  }
+
+  if (imageExposure !== "off") registerImageTool(pi, imageExposure, imageDeps);
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -1721,8 +2028,32 @@ export default async function (pi: ExtensionAPI) {
     argv: process.argv.slice(2),
   });
 
+  // Enforce the host floor that ADR-0001 documents (pi's packaging guidance keeps
+  // peerDependencies at `*`, so the version is checked here). On a pre-1.0.0 host
+  // the model-config union and `exposure` do not exist; fail loudly instead of
+  // registering a half-working provider.
+  if (!hostVersionSupported(VERSION)) {
+    throw new Error(
+      `pi-alibaba-models 2.0.0 requires pi 1.0.0 or newer (found ${VERSION}). ` +
+      `Stay on pi-alibaba-models 1.5.3 for older hosts.`,
+    );
+  }
+
   migrateLegacyAuth();
   const config = loadConfig();
+  if (migrateToolExposure(config)) saveConfig(config);
+
+  // Raw provider stream events are captured per provider/model and classified
+  // by structure, so a rate limit or backend failure phrased a new way is still
+  // retried. Notification-only: the rewrite below reads the classification when
+  // the wording-based matchers cannot recognize the turn, and the text matchers
+  // stay as the fallback for turns where no raw event was seen.
+  const streamErrorByModel = new Map<string, StreamErrorClass>();
+  pi.on("provider_stream_event", (event) => {
+    if (event.provider !== "alibaba-plan" && event.provider !== "alibaba-cloud") return;
+    const cls = classifyStreamError(event.data);
+    if (cls) streamErrorByModel.set(`${event.provider}/${event.model}`, cls);
+  });
 
   // DashScope reports some transient failures as SSE `server_error` events
   // over HTTP 200: rate limits with `<429>` in the message, and inference-
@@ -1732,14 +2063,42 @@ export default async function (pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     const { message } = event;
     if (message.role !== "assistant") return;
-    if (message.stopReason !== "error") return;
     if (message.provider !== "alibaba-plan" && message.provider !== "alibaba-cloud") return;
+    const key = `${message.provider}/${message.model}`;
+    const cls = streamErrorByModel.get(key);
+    // Consumed on every finalized assistant message, so a classification from a
+    // recovered turn cannot leak into a later permanent error.
+    streamErrorByModel.delete(key);
+    if (message.stopReason !== "error") return;
     const errorMessage = message.errorMessage ?? "";
     const rewritten =
       rewriteDashScopeRateLimitErrorMessage(errorMessage) ??
-      rewriteDashScopeBackendOverflowMessage(errorMessage);
+      rewriteDashScopeBackendOverflowMessage(errorMessage) ??
+      rewriteFromStreamError(errorMessage, cls);
     if (!rewritten) return;
     return { message: { ...message, errorMessage: rewritten } };
+  });
+
+  // A tool with `codemode` exposure never activates, so `promptSnippet` and
+  // `promptGuidelines` are never rendered. One system-prompt section tells the
+  // model the tools exist and points image generation at the recommended
+  // family. Present only while at least one Alibaba tool is codemode-exposed.
+  pi.on("before_agent_start", (event) => {
+    const cfg = loadConfig();
+    const callable: string[] = [];
+    if (resolveToolsExposure(cfg) === "codemode") {
+      callable.push("`alibaba_tools` (billed Qwen sidecar: web search, page extraction, sandbox computation, image search)");
+    }
+    if (resolveImageExposure(cfg) === "codemode") {
+      callable.push("`alibaba_image` (DashScope image generation and editing)");
+    }
+    if (!callable.length) return;
+    event.systemPromptOptions.sections = {
+      ...event.systemPromptOptions.sections,
+      alibaba:
+        `Alibaba tools are callable from codemode scripts: ${callable.join("; ")}. ` +
+        "Prefer `qwen-image-*` models for image generation.",
+    };
   });
 
   // Startup contract (plan C): seed registration from the private bundle;
@@ -1754,7 +2113,7 @@ export default async function (pi: ExtensionAPI) {
   // before any fetch can hit the previous key's endpoint.
   if (bootKey) await ensureCloudEndpointBound(bootKey);
   if (!planDefs.length && planCred?.access) await loadPlanCatalog(true);
-  if ((!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) && bootKey) {
+  if (bootKey && (!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED || !cloudImagesLoaded)) {
     await loadCloudCatalog(loadConfig().cloudDomain || DEFAULT_CLOUD_DOMAIN, bootKey, true);
   }
   seedFromSnapshot();
@@ -1789,9 +2148,27 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // ── Command: /alibaba ──────────────────────────────────────────────
+  // The image surface reads live config and the curated image catalogue
+  // through deps, so image-tool.ts needs no import back into this module.
+  const imageDeps: ImageToolDeps = {
+    loadConfig: () => loadConfig(),
+    imageCatalogIds: () => cloudImageDefs.map((r) => r.id),
+  };
   pi.registerCommand("alibaba", {
-    description: "Manage Alibaba (Plan + Cloud) configuration",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
+    description: "Manage Alibaba (Plan + Cloud) configuration, or generate an image with /alibaba image <prompt>",
+    handler: async (args, ctx: ExtensionCommandContext) => {
+      // Subcommand form: `/alibaba image <prompt> [flags]` generates an image
+      // without codemode (it calls the model registry directly). `image` is the
+      // only reserved first word; a bare `/alibaba` opens the menu.
+      const sub = args.trim();
+      if (sub === "image" || sub.startsWith("image ")) {
+        await runImageCommand(pi, sub.slice("image".length).trim(), ctx, imageDeps);
+        return;
+      }
+      if (sub && !sub.startsWith("image")) {
+        ctx.ui.notify(`Unknown /alibaba subcommand: ${sub.split(/\s+/)[0]}. Try: /alibaba image <prompt>`, "error");
+        return;
+      }
       const choice = await ctx.ui.select("Alibaba:", [
         "Status",
         "Refresh model lists",
@@ -1802,7 +2179,9 @@ export default async function (pi: ExtensionAPI) {
         "Cloud — Auto workspace domain",
         "Cloud — Change API Format",
         "Cloud — Session Cache: On / Off",
-        "Cloud — DashScope built-in tools",
+        "Tools — Exposure",
+        "Tools — Sidecar model",
+        "Image — Default model",
         "Rate limits (Cloud)",
         "Cloud — Authorized-only Filter",
         "Context Window — Override",
@@ -1833,9 +2212,11 @@ export default async function (pi: ExtensionAPI) {
           `       Auto-WS:   ${cfg.cloudAutoWorkspaceDomain === false ? "off" : "on"}${cfg.cloudWorkspaceId ? ` (WorkspaceId ${cfg.cloudWorkspaceId})` : ""}`,
           `       Format:    ${cloudFmt}${fallbacks ? ` (${fallbacks} model${fallbacks === 1 ? "" : "s"} fall back to Chat Completions)` : ""}`,
           `       Sess.cache: ${cfg.cloudSessionCache === false ? "off" : "on (Responses header)"}`,
-          `       Sidecar:   ${cfg.cloudSidecarTools ? `on (${cfg.cloudSidecarModel || "auto Qwen"})` : "off"}`,
+          `       Sidecar:   ${resolveToolsExposure(cfg) === "off" ? "off" : `${resolveToolsExposure(cfg)} (${cfg.cloudSidecarModel || "auto Qwen"})`}`,
           `       Auth-only: ${cfg.cloudAuthorizedOnly === false ? "off" : "on (when endpoint available)"}${cfg.cloudAuthorizedFilteredLast ? " — active (filtered list)" : ""}`,
-          `       Models:    ${cloudDefs.length} (${cloudState})`,
+          `       Models:    ${cloudDefs.length} chat (${cloudState})`,
+          `       Images:    ${cloudImageDefs.length} registered; default ${cfg.imageModel || DEFAULT_IMAGE_MODEL}`,
+          `       Tools:     alibaba_tools=${resolveToolsExposure(cfg)}, alibaba_image=${resolveImageExposure(cfg)}`,
         ];
         const overrides = cfg.contextWindowOverrides;
         if (overrides && Object.keys(overrides).length) {
@@ -2041,35 +2422,58 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
-      if (choice === "Cloud — DashScope built-in tools") {
-        const sel = await ctx.ui.select("alibaba_tools sidecar (Cloud Qwen only, billed separately):", [
-          cfg.cloudSidecarTools ? "On (keep enabled)" : "Enable",
-          "Disable",
-          "Enable and set sidecar model…",
+      if (choice === "Tools — Exposure") {
+        const tool = await ctx.ui.select("Which tool?", [
+          `alibaba_tools (sidecar, billed) — now ${resolveToolsExposure(cfg)}`,
+          `alibaba_image (image generation) — now ${resolveImageExposure(cfg)}`,
         ]);
+        if (!tool) return;
+        const isImage = tool.startsWith("alibaba_image");
+        const current = isImage ? resolveImageExposure(cfg) : resolveToolsExposure(cfg);
+        const options = TOOL_EXPOSURES.map((e) => `${current === e ? "• " : "  "}${TOOL_EXPOSURE_LABELS[e]}`);
+        const sel = await ctx.ui.select(
+          `${isImage ? "alibaba_image" : "alibaba_tools"} exposure (now ${current}):`,
+          options,
+        );
         if (!sel) return;
-        if (sel === "Disable") {
-          cfg.cloudSidecarTools = false;
-          saveConfig(cfg);
-          ctx.ui.notify("alibaba_tools disabled. Reloading…", "info");
-          await ctx.reload();
-          return;
-        }
-        cfg.cloudSidecarTools = true;
-        if (sel.startsWith("Enable and set")) {
-          const id = (await ctx.ui.input(
-            `Sidecar Qwen model id (blank = auto; currently ${cfg.cloudSidecarModel || "auto"}):`,
-          ))?.trim();
-          if (id) cfg.cloudSidecarModel = id;
-          else delete cfg.cloudSidecarModel;
-        }
-        saveConfig(cfg);
-        if (!readCloudKey()) {
-          ctx.ui.notify("alibaba_tools enabled, but no Cloud key yet. /login → Alibaba Cloud or set $DASHSCOPE_API_KEY, then retry.", "warning");
-        } else {
-          ctx.ui.notify(`alibaba_tools enabled (${cfg.cloudSidecarModel || "auto Qwen"}). Reloading…`, "info");
-        }
+        const idx = options.indexOf(sel);
+        const picked = idx >= 0 ? TOOL_EXPOSURES[idx] : current;
+        const next: AlibabaConfig = { ...cfg };
+        if (isImage) next.alibabaImageExposure = picked;
+        else next.alibabaToolsExposure = picked;
+        saveConfig(next);
+        const note = picked === "codemode"
+          ? " Requires codemode to be enabled in pi; with codemode off this tool is unreachable."
+          : "";
+        ctx.ui.notify(`${isImage ? "alibaba_image" : "alibaba_tools"} exposure: ${picked}.${note} Reloading…`, "info");
         await ctx.reload();
+        return;
+      }
+
+      if (choice === "Tools — Sidecar model") {
+        const id = (await ctx.ui.input(
+          `Sidecar Qwen model id (blank = auto; currently ${cfg.cloudSidecarModel || "auto"}):`,
+        ))?.trim();
+        if (id === undefined) return;
+        if (id) cfg.cloudSidecarModel = id;
+        else delete cfg.cloudSidecarModel;
+        saveConfig(cfg);
+        ctx.ui.notify(`Sidecar model: ${cfg.cloudSidecarModel || "auto (Qwen Flash/Plus preferred)"}.`, "info");
+        return;
+      }
+
+      if (choice === "Image — Default model") {
+        const ids = cloudImageDefs.map((r) => r.id);
+        const CLEAR = "Clear (pick automatically)";
+        const sel = await ctx.ui.select(
+          `Default image model (now ${cfg.imageModel || DEFAULT_IMAGE_MODEL}):`,
+          [...ids, CLEAR],
+        );
+        if (!sel) return;
+        if (sel === CLEAR) delete cfg.imageModel;
+        else cfg.imageModel = sel;
+        saveConfig(cfg);
+        ctx.ui.notify(`Default image model: ${cfg.imageModel || `${DEFAULT_IMAGE_MODEL} (auto)`}`, "info");
         return;
       }
 
@@ -2207,81 +2611,5 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  if (config.cloudSidecarTools) {
-    pi.registerTool({
-      name: "alibaba_tools",
-      label: "Alibaba tools",
-      description:
-        "Separate billed Qwen sidecar for current web information, page extraction, " +
-        "sandbox computation, or image search. Not for local files or shell commands.",
-      promptSnippet:
-        "alibaba_tools: billed Qwen sidecar; search=current facts, research=pages/multi-source, " +
-        "code=sandbox, image=pictures.",
-      promptGuidelines: [
-        "Use only when current external information or a DashScope sandbox is needed; skip local/repository work and equivalent results already available from another tool.",
-        "Use search for quick lookups. Use research directly for page extraction or multi-source synthesis, or when search is insufficient; research is slower and costlier.",
-      ],
-      parameters: ALIBABA_TOOLS_PARAMETERS,
-      executionMode: "parallel",
-      async execute(_toolCallId, rawParams: { action?: string; task?: string; strategy?: SidecarStrategy }, signal?: AbortSignal, onUpdate?: (partial: { content: { type: "text"; text: string }[]; details?: unknown }) => void) {
-        const params = rawParams as { action?: string; task?: string; strategy?: SidecarStrategy };
-        const action = String(params.action || "search") as SidecarAction;
-        const task = typeof params.task === "string" ? params.task.trim() : "";
-        const strategy = params.strategy;
-        if (!task) throw new Error("alibaba_tools requires a non-empty task.");
-        if (!["research", "search", "code", "image"].includes(action)) {
-          throw new Error(`Unknown action "${action}". Use search, research, code, or image.`);
-        }
-        const key = readCloudKey();
-        if (!key) {
-          throw new Error("No Cloud API key. Run /login → Alibaba Cloud (API Key) or set $DASHSCOPE_API_KEY.");
-        }
-        await ensureCloudEndpointBound(key);
-        const live = loadConfig();
-        const domain = live.cloudDomain || DEFAULT_CLOUD_DOMAIN;
-        const picked = pickSidecarModel({
-          preferred: live.cloudSidecarModel,
-          catalogIds: cloudDefs.map((m) => m.id),
-          action,
-        });
-        if ("error" in picked) throw new Error(picked.error);
-        const req = buildSidecarRequest({
-          model: picked.id,
-          transport: picked.transport,
-          action,
-          task,
-          strategy,
-        });
-        onUpdate?.({
-          content: [{ type: "text", text: formatSidecarProgress(action, 0, { text: "", sources: [], calls: [] }) }],
-          details: { action, model: picked.id, transport: picked.transport, partial: true },
-        });
-        const res = await runSidecarWithRetry(domain, key, req, signal, (parsed, elapsedMs) => {
-          onUpdate?.({
-            content: [{ type: "text", text: formatSidecarProgress(action, elapsedMs, parsed) }],
-            details: { action, model: picked.id, transport: picked.transport, partial: true, calls: parsed.calls },
-          });
-        }, {
-          onRetry: ({ attempt, maxAttempts, delayMs, reason }) => {
-            onUpdate?.({
-              content: [{ type: "text", text: formatSidecarRetry(action, attempt, maxAttempts, delayMs, reason) }],
-              details: { action, model: picked.id, transport: picked.transport, partial: true, retry: attempt, maxAttempts },
-            });
-          },
-        });
-        if (!res.ok) throw new Error(dashScopeErrorMessage(res.status, res.json));
-        return {
-          content: [{ type: "text", text: formatSidecarResult(res.parsed) }],
-          details: {
-            action,
-            model: picked.id,
-            transport: picked.transport,
-            calls: res.parsed.calls,
-            sourceCount: res.parsed.sources.length,
-            retries: res.retries,
-          },
-        };
-      },
-    } as Parameters<ExtensionAPI["registerTool"]>[0]);
-  }
+  registerAlibabaTools(pi, config, imageDeps);
 }
