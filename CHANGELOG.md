@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.1
+
+Re-verified against pi **1.0.4** (2026-10-06): `tsc --noEmit` clean (tsc 6.0.3), 183/183 tests green, and `pi -ne -e <repo> --offline --list-models alibaba-cloud` registers the provider on a dummy key. The 1.0.1–1.0.4 patch releases changed no API this extension relies on — the extension-API delta in 1.0.4 is additive (`registerToolRenderer`, `samplingParamsByThinkingLevel`, `getPromptGuidelines`). Only the host-floor error message follows the package version.
+
 ## 2.0.0
 
 **Requires pi 1.0.0 or newer.** Adds DashScope image models and a dedicated image tool, makes tool exposure configurable (default `codemode`, a behaviour change for `alibaba_tools`), classifies stream errors by structure, and drops the pre-1.0.0 compatibility shim. See `docs/adr/0001-drop-pre-1.0.0-hosts.md` and `docs/specs/2.0.0-pi-1.0-frontier.md`.

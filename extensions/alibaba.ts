@@ -2034,7 +2034,7 @@ export default async function (pi: ExtensionAPI) {
   // registering a half-working provider.
   if (!hostVersionSupported(VERSION)) {
     throw new Error(
-      `pi-alibaba-models 2.0.0 requires pi 1.0.0 or newer (found ${VERSION}). ` +
+      `pi-alibaba-models 2.0.1 requires pi 1.0.0 or newer (found ${VERSION}). ` +
       `Stay on pi-alibaba-models 1.5.3 for older hosts.`,
     );
   }
