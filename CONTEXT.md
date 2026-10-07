@@ -49,6 +49,31 @@ The shared timestamp in `alibaba-config.json` that decides whether a fetch is du
 snapshot does not carry one.
 _Avoid_: TTL
 
+### Model limits
+
+**Request cap**:
+The input size Chat Completions and the Anthropic shape enforce, with a `400 Range of input length
+should be [1, N]` above it. Per model, and equal to no single catalog field.
+_Avoid_: context limit, max input
+
+**Responses cap**:
+Where the Responses endpoint stops accepting and starts **silently truncating** — keeping the head and
+the tail of the transcript and dropping the middle. Not an error, and not the documented "~80 %" for
+every model.
+_Avoid_: truncation limit, 80 % rule
+
+**Declared window**:
+The `contextWindow` a card carries: the effective cap for the shape that card rides, so pi compacts
+before the endpoint rejects or hollows out the transcript. The catalog's `context_window` is an input
+to it, never the value itself.
+_Avoid_: context window (that is the catalog's number)
+
+**Measured / derived**:
+A cap from `MEASURED_INPUT_CAPS` (probed against the endpoint, dated) versus one computed from the
+catalog rows for a model nobody probed. Status prints which is which, so a guess is visible as a
+guess.
+_Avoid_: known/unknown, exact/approximate
+
 ### Prompt cache
 
 **Explicit cache**:

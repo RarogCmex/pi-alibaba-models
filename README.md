@@ -198,9 +198,41 @@ Completions shapes — and the declared read/write pair follows that. Families w
 rows (`glm-5.3`, `kimi-k3`, `deepseek-v4.x`) stay on implicit caching, where the header and the
 markers are no-ops and reads cost 10–25 %.
 
-`responsesInputGuard` (default on) declares 80 % of the catalog context window on Responses models:
-the endpoint silently truncates input above that, and a truncated tail also invalidates the cached
-prefix for every later turn.
+**The declared context window is what the endpoint accepts, not what the catalog calls the window.**
+Completions and Anthropic reject an oversized prompt with `400 Range of input length should be
+[1, N]`; Responses **silently truncates** instead — keeping the head and the tail and dropping the
+middle, so the model answers confidently over a transcript with a hole in it, and the cached prefix
+dies with it. `N` is per model and matches no single catalog field (it is `reasoning_max_input_tokens`
+for qwen3.8-*, `max_input_tokens` for MiniMax-M2.1, and plain `context_window` for qwen-plus,
+kimi-k2.6, deepseek-v3.2 and glm-5.1 — where it is *larger* than both), so cards declare the
+**measured** cap where we have one and a derived one otherwise:
+
+| Model | catalog window | Responses | Completions / Anthropic |
+|---|---|---|---|
+| qwen3.8-max-0902 | 1 000 000 | **792 945** measured | 983 616 measured |
+| qwen3.8-flash | 1 000 000 | **800 056** measured | 983 616 measured |
+| qwen3.7-plus / -flash, qwen3.6-flash | 1 000 000 | **792 907** measured | 983 616 derived |
+| qwen3.5-plus / -flash / -27b / -35b-a3b | 1 000 000 / 262 144 | **90 000** measured generation budget | 983 616 / 258 048 |
+| deepseek-v4.1-flash | 1 000 000 | **754 977** measured | 1 000 000 measured |
+| deepseek-v4-pro | 1 000 000 | 755 000 derived | 1 000 000 derived |
+| glm-5.3, kimi-k3 | 1 000 000 | 780 000 derived | 1 000 000 (the window binds) |
+| MiniMax-M2.1 | 204 800 | 134 184 derived | 172 032 measured |
+
+The qwen3.5 line is the reason this is measured rather than computed: the documented rule ("~80 % of
+the context window") holds at 79.3–80.0 % for qwen3.6/3.7/3.8 and 75.5 % for deepseek-v4, but qwen3.5
+sits on a flat ~90 000-token budget — 9 % of a 1 M window. Deriving 80 % there would let pi fill a
+transcript the endpoint then hollows out.
+
+`/alibaba → Status` prints the declared window for the model in use **and where it came from**
+(`measured` / `derived` / `your override` / `catalog`), so a guess is visible as a guess. A
+`Context Window — Override` still wins outright, and `/alibaba → Cloud — Responses Input Guard: On /
+Off` re-declares the full window if you would rather see the catalog number and accept the
+truncation. Measurements, method and a re-probe script:
+[`docs/notes/2026-10-07-dashscope-input-caps.md`](docs/notes/2026-10-07-dashscope-input-caps.md).
+
+Fixed on the same pass: `maxTokens` now respects `reasoning_max_output_tokens`, because `qwen3-max`
+answers `Range of max_tokens should be [1, 32768]` to the 65 536 its own catalog row advertises
+whenever thinking is on — a hard 400 on every turn.
 
 ### Keeping the prefix stable
 
@@ -260,6 +292,7 @@ The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, tex
 | Cloud — Change API Format    | OpenAI Responses (default) / Anthropic Messages / OpenAI Chat Completions |
 | Cloud — Session Cache: On / Off | toggles `x-dashscope-session-cache` on Cloud Responses requests |
 | Cloud — Cache Warming        | Engine (extension / pi / off), refresh interval, horizon, minimum prompt size, telemetry, Warm now, Cache statistics |
+| Cloud — Responses Input Guard: On / Off | Whether cards declare the endpoint's effective input cap (measured per model) or the catalog's full context window |
 | Tools — Exposure | Set `alibaba_tools` / `alibaba_image` to codemode (default), direct, deferred, or off |
 | Tools — Sidecar model | Pin the Qwen model `alibaba_tools` uses (blank = auto) |
 | Image — Default model | Pick the default DashScope image model for the tool and `/alibaba image` |

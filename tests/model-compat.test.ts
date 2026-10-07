@@ -13,6 +13,7 @@ import {
   inferAnthropicMaxTokens,
   isReasoningModel,
   isVisionModel,
+  modelCachesPrompt,
   ownedRows,
   parseCatalogCache,
   resolveCloudApi,
@@ -394,7 +395,7 @@ describe("declared cost and the Responses input guard", () => {
   const build = (fmt: string, extra: Record<string, unknown> = {}) =>
     buildCloudModels([card], {
       domain: "dashscope.example", fmt,
-      prices: new Map([["qwen3.8-max-0902", extra.implicit ? IMPLICIT_ONLY : PRICES]]),
+      catalog: new Map([["qwen3.8-max-0902", { prices: extra.implicit ? IMPLICIT_ONLY : PRICES }]]),
       ...extra,
     })[0];
 
@@ -426,17 +427,65 @@ describe("declared cost and the Responses input guard", () => {
 
   it("keeps a stored cost when the catalog has no rows for the id", () => {
     const kept = buildCloudModels([{ ...card, cost: { input: 7, output: 8, cacheRead: 0, cacheWrite: 0 } }],
-      { domain: "dashscope.example", fmt: "openai-responses", prices: new Map() })[0];
+      { domain: "dashscope.example", fmt: "openai-responses", catalog: new Map() })[0];
     assert.deepEqual(kept.cost, { input: 7, output: 8, cacheRead: 0, cacheWrite: 0 });
   });
 
-  it("declares 80% of the window on Responses only, and can be turned off", () => {
-    // The endpoint silently truncates input above ~80% of the context window;
-    // a truncated tail also invalidates the cached prefix for later turns.
-    assert.equal(build("openai-responses").contextWindow, 800_000);
-    assert.equal(build("openai-responses", { responsesInputGuard: false }).contextWindow, 1_000_000);
-    assert.equal(build("anthropic-messages").contextWindow, 1_000_000);
-    assert.equal(build("openai-completions").contextWindow, 1_000_000);
+  it("declares the measured input cap, per shape", () => {
+    // qwen3.8-max-0902 was probed at 792,945 on Responses (silent truncation
+    // above it) and 983,616 on the request shapes (a 400 above it) - neither is
+    // the catalog's 1,000,000 window.
+    assert.equal(build("openai-responses").contextWindow, 792_945);
+    assert.equal(build("openai-completions").contextWindow, 983_616);
+    assert.equal(build("anthropic-messages").contextWindow, 983_616);
+    // The guard is the kill switch: full window, and the endpoint's truncation.
+    assert.equal(build("openai-responses", { responsesInputGuard: false }).contextWindow, 983_616);
+  });
+
+  it("never declares more than the catalog window, even where the cap is larger", () => {
+    // glm-5.3 accepts 1,048,576 input tokens against a 1,000,000 window.
+    const [glm] = buildCloudModels([{ ...card, id: "glm-5.3", contextWindow: 1_000_000 }],
+      { domain: "dashscope.example", fmt: "openai-completions", catalog: new Map() });
+    assert.equal(glm.contextWindow, 1_000_000);
+  });
+
+  it("lets a context-window override win outright", () => {
+    const [c] = buildCloudModels([card], {
+      domain: "dashscope.example", fmt: "openai-responses", catalog: new Map(),
+      overrides: { "qwen3.8-max-0902": 500_000 },
+    });
+    assert.equal(c.contextWindow, 500_000);
+  });
+});
+
+describe("modelCachesPrompt", () => {
+  const prices = (over: Partial<CatalogPrices>): CatalogPrices => ({
+    input: 1, output: 2, implicitRead: 0, explicitRead: 0, explicitWrite: 0,
+    explicitCache: false, tiered: false, thinkingOutput: false, ...over,
+  });
+
+  it("falls back to the family table when the catalog carried no rows", () => {
+    assert.equal(modelCachesPrompt("qwen3.8-max-0902"), true);
+    assert.equal(modelCachesPrompt("glm-5.3"), true);
+    assert.equal(modelCachesPrompt("kimi-k3"), true);
+    // The open-weight qwen3-<size>b line has no documented caching, and an
+    // unknown family is not assumed to have one either: warming either would
+    // spend quota to keep alive a block that is never created.
+    assert.equal(modelCachesPrompt("qwen3-30b-a3b"), false);
+    assert.equal(modelCachesPrompt("brand-new-family-9"), false);
+  });
+
+  it("trusts the catalog rows over the family table", () => {
+    const catalog = new Map<string, { prices: CatalogPrices }>([
+      ["explicit-only", { prices: prices({ explicitCache: true, explicitRead: 1, explicitWrite: 15 }) }],
+      ["implicit-only", { prices: prices({ implicitRead: 1.5 }) }],
+      ["no-cache-rows", { prices: prices({}) }],
+    ]);
+    assert.equal(modelCachesPrompt("explicit-only", catalog), true);
+    assert.equal(modelCachesPrompt("implicit-only", catalog), true);
+    assert.equal(modelCachesPrompt("no-cache-rows", catalog), false);
+    // A model the rows know nothing about still falls back to the family table.
+    assert.equal(modelCachesPrompt("glm-5.3", catalog), true);
   });
 });
 

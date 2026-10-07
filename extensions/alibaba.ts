@@ -51,6 +51,11 @@ import {
 } from "./cache-warm.ts";
 import { injectCacheControl } from "./cache-control.ts";
 import {
+  resolveContextWindow,
+  resolveOutputCap,
+  type CatalogLimits,
+} from "./model-limits.ts";
+import {
   ALIBABA_TOOLS_PARAMETERS,
   buildSidecarRequest,
   dashScopeErrorMessage,
@@ -806,20 +811,47 @@ interface ApiV1Model {
   inference_metadata?: { request_modality?: string[]; response_modality?: string[] };
   model_info?: {
     context_window?: number | null;
+    max_input_tokens?: number | null;
     max_output_tokens?: number | null;
+    max_reasoning_tokens?: number | null;
+    reasoning_max_input_tokens?: number | null;
+    reasoning_max_output_tokens?: number | null;
   };
   prices?: CatalogPriceRange[];
 }
 
-// Raw catalog prices per model id, filled by the last real fetch and seeded
-// from the private snapshot at boot. `buildCloudModels` turns them into the
-// declared `cost` — the declaration depends on the session-cache header, the
-// Completions markers and the currency setting, all of which can change without
-// a refetch, so the raw numbers are what gets kept.
-const cloudPrices = new Map<string, CatalogPrices>();
+// What the native catalog told us about one Cloud model, kept raw: prices and
+// size limits. Both are policy inputs, not declarations — the declared `cost`
+// depends on the session-cache header, the Completions markers and the currency
+// setting, and the declared `contextWindow` on the wire shape, all of which can
+// change without a refetch.
+export interface CatalogEntry {
+  prices?: CatalogPrices;
+  limits?: CatalogLimits;
+}
+const cloudCatalog = new Map<string, CatalogEntry>();
 
 /** Price rows of one catalog model, or undefined when the catalog had none. */
-export const cloudPricesFor = (id: string): CatalogPrices | undefined => cloudPrices.get(id);
+export const cloudPricesFor = (id: string): CatalogPrices | undefined => cloudCatalog.get(id)?.prices;
+
+/** Size limits (`model_info`) of one catalog model, when the catalog carried them. */
+export const cloudLimitsFor = (id: string): CatalogLimits | undefined => cloudCatalog.get(id)?.limits;
+
+const positiveOrNull = (v: number | null | undefined): number | undefined =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+
+function catalogEntryOf(m: ApiV1Model): CatalogEntry {
+  const info = m.model_info ?? {};
+  return {
+    limits: {
+      contextWindow: positiveOrNull(info.context_window),
+      maxInput: positiveOrNull(info.max_input_tokens),
+      reasoningMaxInput: positiveOrNull(info.reasoning_max_input_tokens),
+      maxOutput: positiveOrNull(info.max_output_tokens),
+      reasoningMaxOutput: positiveOrNull(info.reasoning_max_output_tokens),
+    },
+  };
+}
 
 export function applyAuthorizedFilter<T extends { id: string }>(
   models: T[],
@@ -859,7 +891,9 @@ async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<ChatM
           tierTokens: cfg.priceTierTokens,
           thinkingOutput: cfg.priceThinkingOutput !== false,
         });
-        if (prices.input > 0 || prices.output > 0) cloudPrices.set(m.model, prices);
+        const entry = catalogEntryOf(m);
+        if (prices.input > 0 || prices.output > 0) entry.prices = prices;
+        cloudCatalog.set(m.model, entry);
         models.push({
           id: m.model,
           name: m.name || m.model,
@@ -1082,13 +1116,6 @@ export function countFallbackModels(models: { id: string }[], fmt: CloudApiForma
   return models.filter((m) => resolveCloudApi(m.id, fmt) !== fmt).length;
 }
 
-// The Responses endpoint accepts at most ~80% of the model's context window as
-// input and **silently truncates** the rest (alibabacloud.com/help/en/model-
-// studio/qwen-api-via-openai-responses). Declaring the usable size makes pi
-// compact before that happens; a truncated tail also destroys the cached prefix
-// for every later turn.
-export const RESPONSES_INPUT_FRACTION = 0.8;
-
 /** Everything `buildCloudModels` needs that is not the catalog itself. */
 export interface CloudModelBuildOptions {
   domain: string;
@@ -1103,9 +1130,13 @@ export interface CloudModelBuildOptions {
   /** Unit of the declared `cost.*`. Default "cny" (what the console bills). */
   currency?: "cny" | "usd";
   cnyPerUsd?: number;
-  /** Raw catalog prices; defaults to the map filled by the last fetch. */
-  prices?: ReadonlyMap<string, CatalogPrices>;
-  /** Declare 80% of the catalog window on Responses models. Default true. */
+  /** Raw catalog rows (prices + size limits); defaults to the last fetch. */
+  catalog?: ReadonlyMap<string, CatalogEntry>;
+  /**
+   * Declare the shape's effective input cap instead of the catalog window.
+   * Default true; turning it off re-declares the full window and accepts the
+   * Responses endpoint's silent middle-truncation.
+   */
   responsesInputGuard?: boolean;
 }
 
@@ -1121,6 +1152,28 @@ export function explicitCacheActive(api: string, sessionCache: boolean, cacheCon
   return cacheControl;
 }
 
+/**
+ * Whether a model has a prompt cache to keep alive. The catalog's price rows
+ * are the machine-readable answer — a model with no `input_token_cache*` row has
+ * nothing to warm (the open-weight `qwen3-<size>b` line) — and the family table
+ * is the fallback for a boot served from the compatible-mode listing, which
+ * carries no rows at all.
+ *
+ * Measured per family on 2026-10-07 (`docs/notes/…-cache-families.md`):
+ * explicit caching on qwen3.x, glm-5.1, kimi-k2.5/k2.6/k2.7-code and
+ * deepseek-v3.2; implicit on glm-4.6/5.2/5.3, kimi-k3, deepseek-v4.x and
+ * MiniMax-M2.1 — the last only above ~4k tokens, which the default 20k prompt
+ * floor already clears.
+ */
+export function modelCachesPrompt(
+  id: string,
+  catalog: ReadonlyMap<string, CatalogEntry> = cloudCatalog,
+): boolean {
+  const p = catalog.get(id)?.prices;
+  if (p) return p.explicitCache || p.implicitRead > 0;
+  return capsFor(id).cache === true;
+}
+
 export function buildCloudModels(
   models: ChatModelConfig[],
   opts: CloudModelBuildOptions,
@@ -1130,7 +1183,7 @@ export function buildCloudModels(
   const sessionCache = opts.sessionCache !== false;
   const cacheControl = opts.cacheControl !== false;
   const warm = opts.warm ?? DEFAULT_WARM_SETTINGS;
-  const prices = opts.prices ?? cloudPrices;
+  const catalog = opts.catalog ?? cloudCatalog;
   const currency = opts.currency === "usd" ? "usd" : "cny";
   const guard = opts.responsesInputGuard !== false;
   return models.map((m) => {
@@ -1138,7 +1191,8 @@ export function buildCloudModels(
     const tc = thinkingConfigFor(m.id, api);
     const openai = api !== "anthropic-messages";
     const card = deriveCard(m.id, m, opts.overrides);
-    const raw = prices.get(m.id);
+    const entry = catalog.get(m.id);
+    const raw = entry?.prices;
     // Which cache the wire will actually use, per shape: the header on
     // Responses, pi-ai's own `cache_control` injection on the Anthropic shape,
     // our markers on Completions. Declaring the wrong pair would misprice every
@@ -1153,14 +1207,24 @@ export function buildCloudModels(
           opts.cnyPerUsd ?? DEFAULT_CNY_PER_USD,
         )
       : m.cost;
+    // What the endpoint actually accepts on this shape, which is not the
+    // catalog's context window: Completions/Anthropic 400 above a per-model cap,
+    // Responses silently truncates above a different one (see model-limits.ts).
+    const win = resolveContextWindow(m.id, api, entry?.limits, card.contextWindow, {
+      override: opts.overrides?.[m.id] ?? opts.overrides?.["*"],
+      responsesGuard: guard,
+    });
+    // `reasoning_max_output_tokens` is a hard ceiling while thinking is on
+    // (qwen3-max rejects the 65 536 its own catalog row advertises with `Range
+    // of max_tokens should be [1, 32768]`), and a card cannot express "unless
+    // the level is off" — so the lower of the two is declared.
+    const outputCap = resolveOutputCap(entry?.limits, m.maxTokens);
     return {
       ...m,
       ...card,
-      contextWindow: guard && api === "openai-responses"
-        ? Math.floor(card.contextWindow * RESPONSES_INPUT_FRACTION)
-        : card.contextWindow,
+      contextWindow: win.window,
       cost,
-      maxTokens: resolveMaxTokens(m.id, api, m.maxTokens),
+      maxTokens: resolveMaxTokens(m.id, api, outputCap ?? 0),
       promptCache: promptCacheFor(m.id, warm),
       thinkingLevelMap: tc?.thinkingLevelMap,
       compat: mergeCompat(m.compat, tc, openai),
@@ -1669,11 +1733,11 @@ const releaseCatalogLock = () => { try { fs.unlinkSync(CATALOG_LOCK_PATH); } cat
 interface CatalogCache {
   v: 2;
   plan?: { fetchedAt: number; models: PlanModelDef[] };
-  // `prices` carries the raw catalog rows per model id, so a boot with no
-  // network can still declare cache and currency policy. Optional: an older
-  // snapshot without it is valid, it just declares no cache prices until the
-  // next fetch.
-  cloud?: { fetchedAt: number; models: ChatModelConfig[]; prices?: Record<string, CatalogPrices> };
+  // `catalog` carries the raw per-model rows (prices and size limits), so a
+  // boot with no network can still declare cache, currency and window policy.
+  // Optional: an older snapshot without it is valid, it just keeps whatever the
+  // stored cards already declared until the next fetch.
+  cloud?: { fetchedAt: number; models: ChatModelConfig[]; catalog?: Record<string, CatalogEntry> };
   // Curated image rows (the native IG listing, already filtered). Optional:
   // an older v2 snapshot without them is still valid, just image-less offline.
   cloudImages?: { fetchedAt: number; models: ImageCatalogRow[] };
@@ -1702,8 +1766,8 @@ function seedFromSnapshot() {
   if (!planDefs.length && cache?.plan?.models?.length) planDefs = cache.plan.models;
   if ((!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) && cache?.cloud?.models?.length) {
     cloudDefs = cache.cloud.models;
-    for (const [id, p] of Object.entries(cache.cloud.prices ?? {})) {
-      if (p && typeof p === "object" && !cloudPrices.has(id)) cloudPrices.set(id, p);
+    for (const [id, entry] of Object.entries(cache.cloud.catalog ?? {})) {
+      if (entry && typeof entry === "object" && !cloudCatalog.has(id)) cloudCatalog.set(id, entry);
     }
   }
   // Presence of the `cloudImages` section counts as "already fetched", even when
@@ -1769,12 +1833,12 @@ async function loadCloudCatalog(domain: string, apiKey: string, force: boolean):
     saveConfig(cfg);
     const patch: Partial<CatalogCache> = {};
     if (models.length) {
-      const prices: Record<string, CatalogPrices> = {};
+      const catalog: Record<string, CatalogEntry> = {};
       for (const m of models) {
-        const p = cloudPrices.get(m.id);
-        if (p) prices[m.id] = p;
+        const entry = cloudCatalog.get(m.id);
+        if (entry) catalog[m.id] = entry;
       }
-      patch.cloud = { fetchedAt: cfg.cloudFetchedAt, models, prices };
+      patch.cloud = { fetchedAt: cfg.cloudFetchedAt, models, catalog };
     }
     if (imageFetched) patch.cloudImages = { fetchedAt: cfg.cloudFetchedAt, models: cloudImageDefs };
     if (Object.keys(patch).length) updateCatalogCache(patch);
@@ -2247,22 +2311,44 @@ function cacheStatusLines(cfg: AlibabaConfig, warmer: CacheWarmer, logPath: stri
   return lines;
 }
 
-// One line for the model in use: a switch to a family without explicit-cache
-// rows silently changes what a cached turn costs, and this is where it shows.
-function modelCacheLine(
-  model: { provider?: string; id?: string; api?: string } | undefined,
+// Two lines for the model in use. A switch to a family without explicit-cache
+// rows silently changes what a cached turn costs, and the declared window is now
+// a measured per-model cap rather than the catalog's context window — both are
+// worth seeing next to the model name.
+function modelLines(
+  model: { provider?: string; id?: string; api?: string; contextWindow?: number } | undefined,
   cfg: AlibabaConfig,
-): string | undefined {
-  if (model?.provider !== "alibaba-cloud" || !model.id) return undefined;
+): string[] {
+  if (model?.provider !== "alibaba-cloud" || !model.id) return [];
+  const lines: string[] = [];
   const prices = cloudPricesFor(model.id);
-  if (!prices) return undefined;
-  const explicit = explicitCacheActive(
-    model.api ?? "",
-    cfg.cloudSessionCache !== false,
-    cfg.cloudCacheControl !== false,
+  if (prices) {
+    const explicit = explicitCacheActive(
+      model.api ?? "",
+      cfg.cloudSessionCache !== false,
+      cfg.cloudCacheControl !== false,
+    );
+    const tier = prices.tiered ? `, tier ${prices.tier}` : "";
+    lines.push(
+      `       Model:     ${model.id} — ${formatCacheEconomics(prices, explicit, cfg.costCurrency === "usd" ? "usd" : "cny")}${tier}`,
+    );
+  }
+  const win = resolveContextWindow(model.id, model.api ?? "", cloudLimitsFor(model.id), model.contextWindow ?? 0, {
+    responsesGuard: cfg.responsesInputGuard !== false,
+  });
+  const catalogWindow = cloudLimitsFor(model.id)?.contextWindow;
+  const how = win.source === "measured"
+    ? "measured 2026-10-07"
+    : win.source === "derived"
+      ? "derived, not measured for this model"
+      : win.source === "override"
+        ? "your override"
+        : "catalog window";
+  lines.push(
+    `       Window:    ${(win.window || 0).toLocaleString("en-US")} on ${model.api ?? "?"} — ${how}` +
+      (catalogWindow && catalogWindow !== win.window ? ` (catalog says ${catalogWindow.toLocaleString("en-US")})` : ""),
   );
-  const tier = prices.tiered ? `, tier ${prices.tier}` : "";
-  return `       Model:     ${model.id} — ${formatCacheEconomics(prices, explicit, cfg.costCurrency === "usd" ? "usd" : "cny")}${tier}`;
+  return lines;
 }
 
 async function cacheWarmMenu(ctx: ExtensionCommandContext, warmer: CacheWarmer, logPath: string): Promise<void> {
@@ -2478,16 +2564,21 @@ export default async function (pi: ExtensionAPI) {
     // `onPayload`/`transformHeaders`, which is also why pi's own warmer skips
     // them.
     if (headers) {
-      warmer.noteRequest({
-        provider: model.provider,
-        model: model.id,
-        api: model.api,
-        baseUrl: model.baseUrl,
-        headers,
-        payload: outgoing,
-        at: Date.now(),
-      });
-      warmer.noteInFlight(true);
+      if (!modelCachesPrompt(model.id)) {
+        // Warming a model with no cache rows would buy nothing and spend quota.
+        warmer.invalidate(`${model.id} has no prompt caching`);
+      } else {
+        warmer.noteRequest({
+          provider: model.provider,
+          model: model.id,
+          api: model.api,
+          baseUrl: model.baseUrl,
+          headers,
+          payload: outgoing,
+          at: Date.now(),
+        });
+        warmer.noteInFlight(true);
+      }
     }
     return outgoing === event.payload ? undefined : outgoing;
   });
@@ -2662,6 +2753,7 @@ export default async function (pi: ExtensionAPI) {
         "Cloud — Auto workspace domain",
         "Cloud — Change API Format",
         "Cloud — Session Cache: On / Off",
+        "Cloud — Responses Input Guard: On / Off",
         "Cloud — Cache Warming",
         "Tools — Exposure",
         "Tools — Sidecar model",
@@ -2696,9 +2788,10 @@ export default async function (pi: ExtensionAPI) {
           `       Auto-WS:   ${cfg.cloudAutoWorkspaceDomain === false ? "off" : "on"}${cfg.cloudWorkspaceId ? ` (WorkspaceId ${cfg.cloudWorkspaceId})` : ""}`,
           `       Format:    ${cloudFmt}${fallbacks ? ` (${fallbacks} model${fallbacks === 1 ? "" : "s"} fall back to Chat Completions)` : ""}`,
           `       Sess.cache: ${cfg.cloudSessionCache === false ? "off" : "on (Responses header)"}`,
+          `       Input guard: ${cfg.responsesInputGuard === false ? "off (full catalog window)" : "on (cards declare the endpoint's input cap)"}`,
           `       Markers:   ${cfg.cloudCacheControl === false ? "off" : "on (cache_control on Completions)"}`,
           ...cacheStatusLines(cfg, warmer, CACHE_LOG_PATH),
-          ...(modelCacheLine(ctx.model, cfg) ? [modelCacheLine(ctx.model, cfg)!] : []),
+          ...modelLines(ctx.model, cfg),
           `       Sidecar:   ${resolveToolsExposure(cfg) === "off" ? "off" : `${resolveToolsExposure(cfg)} (${cfg.cloudSidecarModel || "auto Qwen"})`}`,
           `       Auth-only: ${cfg.cloudAuthorizedOnly === false ? "off" : "on (when endpoint available)"}${cfg.cloudAuthorizedFilteredLast ? " — active (filtered list)" : ""}`,
           `       Models:    ${cloudDefs.length} chat (${cloudState})`,
@@ -2903,6 +2996,21 @@ export default async function (pi: ExtensionAPI) {
           `Session cache (x-dashscope-session-cache, Responses format): ${on ? "off" : "on"}.\n` +
           `Writes are billed at 125% of input and re-read at ~10%: keep it on for multi-turn\n` +
           `agent sessions (net win), off if pi is mostly one-shot prompts.`,
+          "info",
+        );
+        await ctx.reload();
+        return;
+      }
+
+      if (choice === "Cloud — Responses Input Guard: On / Off") {
+        const on = cfg.responsesInputGuard !== false;
+        cfg.responsesInputGuard = !on;
+        saveConfig(cfg);
+        ctx.ui.notify(
+          `Responses input guard: ${on ? "off" : "on"}.\n` +
+          `The Responses endpoint accepts ~80% of the context window as input and silently truncates\n` +
+          `the rest, so with the guard on a 1M model is registered as 800k and pi compacts first.\n` +
+          `Off keeps the full window on the card and accepts the truncation.`,
           "info",
         );
         await ctx.reload();

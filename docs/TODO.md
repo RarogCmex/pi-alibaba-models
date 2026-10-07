@@ -104,6 +104,18 @@ monthly token volume.
 
 ### Watch list (needs data, not design)
 
+- **Self-healing input caps.** The 400 text already states the cap (`Range of input length should be
+  [1, N]`), so a `stream-errors`-style classifier could parse it, persist `N` next to
+  `contextWindowOverrides`, and re-register the card — the measured table would then extend itself on
+  first contact instead of waiting for a probe run. Needs care: one failed turn is the price, and a
+  misparse would shrink a window permanently.
+- **Cap drift.** `MEASURED_INPUT_CAPS` is per deployment and dated 2026-10-07. Re-running the free
+  half of `docs/notes/2026-10-07-dashscope-input-caps-probe.py` (`--mode request,output`) costs
+  nothing and covers 15 models in about two minutes; the Responses half costs one truncated request
+  per model.
+- **Per-level output caps.** `qwen3-max` declares 32 768 because thinking-on rejects 65 536, so
+  thinking-off users lose half the ceiling. pi 1.0.4 added `samplingParamsByThinkingLevel`; if pi-ai
+  applies `maxTokens` from it, the card could carry both.
 - **Warm rewrites.** A nonzero `arrived after expiry` count in `/alibaba → Cloud — Cache Warming →
   Cache statistics` means the refresh interval is too long for that prompt size. If it shows up on
   500k+ prompts, scale the interval with the prompt estimate instead of using one constant.

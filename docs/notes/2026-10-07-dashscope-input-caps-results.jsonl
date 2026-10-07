@@ -1,0 +1,34 @@
+{"model": "qwen3.8-max-0902", "mode": "request", "shape": "completions", "ctx": 1000000, "sent_chars": 4830000, "cap": 983616, "s": 309.5, "err": "Range of input length should be [1, 983616]"}
+{"model": "qwen3.8-flash", "mode": "request", "shape": "completions", "ctx": 1000000, "sent_chars": 4830000, "cap": 983616, "s": 5.9, "err": "Range of input length should be [1, 983616]"}
+{"model": "qwen3.7-plus", "mode": "request", "shape": "completions", "ctx": 1000000, "sent_chars": 4830000, "cap": 983616, "s": 12.2, "err": "Range of input length should be [1, 983616]"}
+{"model": "qwen3-max", "mode": "request", "shape": "completions", "ctx": 262144, "sent_chars": 1266155, "cap": 258048, "s": 4.3, "err": "Range of input length should be [1, 258048]"}
+{"model": "qwen3.5-35b-a3b", "mode": "request", "shape": "completions", "ctx": 262144, "sent_chars": 1266155, "cap": 258048, "s": 4.2, "err": "Range of input length should be [1, 258048]"}
+{"model": "qwen3-30b-a3b", "mode": "request", "shape": "completions", "ctx": 131072, "sent_chars": 633077, "cap": 98304, "s": 3.3, "err": "Range of input length should be [1, 98304]"}
+{"model": "glm-5.3", "mode": "request", "shape": "completions", "ctx": 1000000, "sent_chars": 4830000, "cap": 1048576, "s": 8.6, "err": "Range of input length should be [1, 1048576]"}
+{"model": "glm-5.1", "mode": "request", "shape": "completions", "ctx": 202745, "sent_chars": 979258, "cap": 202745, "s": 3.1, "err": "Range of input length should be [1, 202745]"}
+{"model": "glm-4.6", "mode": "request", "shape": "completions", "ctx": 202752, "sent_chars": 979292, "cap": 169984, "s": 3.6, "err": "<400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 169984]"}
+{"model": "kimi-k3", "mode": "request", "shape": "completions", "ctx": 1000000, "sent_chars": 4830000, "cap": 1048576, "s": 6.8, "err": "Range of input length should be [1, 1048576]"}
+{"model": "kimi-k2.6", "mode": "request", "shape": "completions", "ctx": 262144, "sent_chars": 1266155, "cap": 262144, "s": 3.9, "err": "Range of input length should be [1, 262144]"}
+{"model": "deepseek-v4.1-flash", "mode": "request", "shape": "completions", "ctx": 1000000, "sent_chars": 4830000, "cap": 1000000, "s": 19.0, "err": "Range of input length should be [1, 1000000]"}
+{"model": "deepseek-v3.2", "mode": "request", "shape": "completions", "ctx": 131072, "sent_chars": 633077, "cap": 131072, "s": 3.5, "err": "Range of input length should be [1, 131072]"}
+{"model": "MiniMax-M2.1", "mode": "request", "shape": "completions", "ctx": 204800, "sent_chars": 989183, "cap": 172032, "s": 4.0, "err": "<400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 172032]"}
+{"model": "qwen-plus", "mode": "request", "shape": "completions", "ctx": 1000000, "sent_chars": 4830000, "cap": 1000000, "s": 9.3, "err": "Range of input length should be [1, 1000000]"}
+{"model": "qwen3.5-flash", "mode": "responses", "shape": "responses", "ctx": 1000000, "sent_chars": 4830000, "cap": 89127, "s": 29.8, "err": null}
+{"model": "qwen3.7-flash", "mode": "responses", "shape": "responses", "ctx": 1000000, "sent_chars": 4830000, "cap": 792907, "s": 261.9, "err": null}
+{"model": "qwen3.5-27b", "mode": "responses", "shape": "responses", "ctx": 262144, "sent_chars": 1266155, "cap": 0, "s": 52.0, "err": null, "note": "HTTP 200 with input_tokens 0 - the shape DashScope uses for a backend failure; unmeasured, takes the qwen3.5 generation rule"}
+{"model": "qwen3.6-35b-a3b", "mode": "responses", "shape": "responses", "ctx": 262144, "sent_chars": 1266155, "cap": 0, "s": 104.6, "err": null}
+{"model": "deepseek-v4.1-flash", "mode": "responses", "shape": "responses", "ctx": 1000000, "sent_chars": 4830000, "cap": 754977, "s": 98.9, "err": null}
+{"model": "qwen3.7-plus", "mode": "responses", "shape": "responses", "ctx": 1000000, "sent_chars": 4830000, "cap": 792907, "s": 434.3, "err": null}
+{"model": "qwen3.6-flash", "mode": "responses", "shape": "responses", "ctx": 1000000, "sent_chars": 4830000, "cap": 792907, "s": 510.7, "err": null}
+{"model": "qwen3.5-27b", "mode": "responses", "shape": "responses", "ctx": 262144, "sent_chars": 1266155, "cap": 0, "s": 82.9, "err": null, "note": "HTTP 200 with input_tokens 0 - the shape DashScope uses for a backend failure; unmeasured, takes the qwen3.5 generation rule"}
+{"model": "qwen3.8-max-0902", "mode": "responses", "shape": "responses", "ctx": 1000000, "sent_chars": 4830000, "cap": 792945, "s": 301.8, "err": null}
+{"model": "deepseek-v3.2", "mode": "request", "shape": "anthropic", "cap": 131072, "s": 3.7, "err": "HTTP 400: Range of input length should be [1, 131072]"}
+{"model": "MiniMax-M2.1", "mode": "request", "shape": "anthropic", "cap": 172032, "s": 5.4, "err": "HTTP 400: Range of input length should be [1, 172032]"}
+{"model": "glm-4.6", "mode": "request", "shape": "anthropic", "cap": 169984, "s": 52.8, "err": "HTTP 400: Range of input length should be [1, 169984]"}
+{"model": "qwen3-30b-a3b", "mode": "request", "shape": "anthropic", "cap": 98304, "s": 3.4, "err": "HTTP 400: Range of input length should be [1, 98304]"}
+{"model": "qwen3-max", "mode": "output", "sent": 65536, "cap": 32768, "s": 0.9, "err": "HTTP 400: Range of max_tokens should be [1, 32768] (enable_thinking=true)"}
+{"model": "qwen3-max", "mode": "output", "sent": 65536, "cap": null, "s": 1.0, "note": "accepted with enable_thinking=false: the cap only binds while thinking is on"}
+{"model": "qwen3.8-max-0902", "mode": "output", "sent": 131073, "cap": 131072, "s": 1.0, "err": "HTTP 400: Range of max_tokens should be [1, 131072]"}
+{"model": "qwen3.5-35b-a3b", "mode": "truncation-shape", "sent_tokens_completions": 80524, "responses_input_tokens": 80560, "markers_visible": "head,middle,tail"}
+{"model": "qwen3.5-35b-a3b", "mode": "truncation-shape", "sent_tokens_completions": 160835, "responses_input_tokens": 90006, "markers_visible": "head,tail"}
+{"model": "qwen3.5-35b-a3b", "mode": "truncation-shape", "sent_tokens_completions": 240858, "responses_input_tokens": 90000, "markers_visible": "head,tail"}

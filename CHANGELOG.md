@@ -31,16 +31,40 @@
 
 - Completions has no session-cache header, so models whose catalog rows include explicit-cache prices now get up to two `cache_control: {"type": "ephemeral"}` markers injected by `before_provider_request`: one on the last system/developer message (where DashScope serializes the tool definitions) and one on the last markable message, whose 20-content-block backward window catches the previous turn's tail. Tool results are never converted to part arrays, an already-marked payload is left alone, and the injection is gated on catalog rows so families without explicit support are untouched. Verified live on `kimi-k2.6`, `glm-5.1` and `deepseek-v3.2` (`creation` then exactly the same `cached`), which turns their probabilistic implicit hits into deterministic explicit ones. Toggle: `cloudCacheControl`, `/alibaba → Status` line `Markers`.
 
-### Responses input guard
+### Declared context windows follow the endpoint, not the catalog (`extensions/model-limits.ts`)
 
-- The Responses endpoint accepts at most ~80 % of the context window as input and **silently truncates** the rest — which also destroys the cached prefix for every later turn. `responsesInputGuard` (default on) declares `floor(0.8 × window)` on Responses-format cards so pi compacts first: 1 000 000 → 800 000, 262 144 → 209 715. Turn it off if you would rather keep the larger window and accept the truncation.
+- **The catalog's `context_window` is not what a request may contain.** Measured per model on 2026-10-07 (`docs/notes/2026-10-07-dashscope-input-caps.md`): Completions and Anthropic reject an oversized prompt with `400 Range of input length should be [1, N]`, where `N` is `reasoning_max_input_tokens` for qwen3.8-*, `max_input_tokens` for `qwen3-30b-a3b` and `MiniMax-M2.1`, and plain `context_window` for `qwen-plus`, `kimi-k2.6`, `deepseek-v3.2` and `glm-5.1` — on those four it is *larger* than both catalog fields. The Anthropic shape enforces the same numbers (verified on four models) but reports them as `{"code":"InvalidParameter"}` instead of the OpenAI envelope.
+- **Responses does not reject, it silently truncates — and keeps head and tail while dropping the middle.** Marker experiment on `qwen3.5-35b-a3b`: at 80k sent the model saw head, middle and tail; at 160k and 240k it saw head and tail only, with `input_tokens` pinned at ~90 000. An over-budget Responses request therefore produces a confident answer over a transcript with a hole in it, and kills the cached prefix for every later turn.
+- **The documented "~80 % of the context window" is only sometimes true.** Measured Responses caps: 800 056 (qwen3.8-flash), 792 945 (qwen3.8-max-0902), 792 907 (qwen3.7-plus/-flash, qwen3.6-flash), 754 977 (deepseek-v4.1-flash) — but **89 127 / ~90 000 for the qwen3.5 generation**, i.e. 9 % of a 1 M window, which no catalog field predicts. Cards now declare the measured cap per model and shape; unmeasured models fall back to `min(ctx, max_input, reasoning_max_input)` for the request shapes (never above a measurement in the 15-model sample) and to `0.78 × min(requestCap, ctx)` on Responses, with `^qwen3.5-` taking the flat 90 000 and `^deepseek-v4` the measured 0.755. `MEASURED_INPUT_CAPS` is dated and re-measurable with the committed probe (the request caps come free from the 400 text; a Responses cap costs one truncated request).
+- `/alibaba → Status` prints the declared window **and its source** (`measured` / `derived` / `your override` / `catalog`), so an unmeasured model is visibly a guess. `Context Window — Override` still wins outright; `responsesInputGuard: false` (menu: `Cloud — Responses Input Guard: On / Off`) re-declares the full window.
+- **Output caps:** `maxTokens` now folds in `reasoning_max_output_tokens`, because `qwen3-max` (and its two snapshots) answers `Range of max_tokens should be [1, 32768]` to the 65 536 its own catalog row advertises whenever thinking is on — previously a hard 400 on every turn. A card cannot express "unless the level is off", so the lower ceiling is declared.
+
+### Cache support verified per family, and warming gated on it
+
+- Measured on 2026-10-07 across the non-qwen line (`docs/notes/2026-10-07-dashscope-cache-families.md`):
+  **explicit** caching works on `glm-5.1`, `kimi-k2.5`, `kimi-k2.6`, `kimi-k2.7-code`, `deepseek-v3.2`
+  through our injected markers (`creation=N` then `cached=N`, exact), and **implicit** caching on
+  `glm-4.6`, `glm-5.3`, `kimi-k3`, `deepseek-v4-pro`, `deepseek-v4.1-flash` — 128-token quanta on
+  GLM/DeepSeek-4.1, 1024 on `kimi-k3` and `deepseek-v4-pro`. The session-cache header is a confirmed
+  no-op without explicit rows (`glm-5.3` returns the same implicit hit with `enable` and `disable`).
+  The 5-minute TTL renewed on a hit was re-measured on Kimi's explicit block, so one `refreshSeconds`
+  is correct for every family and no per-family TTL table is needed. On the Anthropic shape pi-ai's
+  own markers produce explicit blocks for the families that support them and are silently ignored by
+  the ones that do not, which is what the price declarations already assume.
+- **`MiniMax` is the exception**: no caching at ~1.9k tokens, and at ~7.6k it hit once and missed
+  again 30 s later on an identical prefix — consistent with a per-replica cache. Warming there is a
+  bet, not a guarantee, and the 20k default prompt floor is what keeps it from being pure waste.
+- **`modelCachesPrompt()`**: the engine no longer warms a model with no cache rows in the catalog
+  (`explicitCache || implicitRead > 0`), falling back to the family table when a boot was served from
+  the compatible-mode listing, which carries no rows. The open-weight `qwen3-<size>b` line and unknown
+  families are skipped instead of spending quota on a block that is never created.
 
 ### Status, docs and tests
 
 - `/alibaba → Status` gains four lines: `Markers`, `Warming` (engine, interval, horizon, floor, next refresh, warm counters), `Prices` (unit, tier probe, thinking-output convention) and `Model` (the current model's cache economics and tier), plus the `Cache log` roll-up. A model switch that silently loses explicit caching is now visible.
-- New config keys: `cacheWarm.{mode,refreshSeconds,horizonMinutes,minPromptTokens,telemetry}`, `cloudCacheControl`, `costCurrency`, `cnyPerUsd`, `priceTierTokens`, `priceThinkingOutput`, `responsesInputGuard`. `PI_ALIBABA_CACHE_DEBUG=1` logs every warm to stderr.
-- README: new **Prompt cache & warming** section (mechanism, settings table, what a cached turn costs) and a rewritten caching bullet in Limitations. CONTEXT.md: vocabulary for the warm engine, warm template, cache telemetry, price tier, cost unit and cache marker.
-- Tests: 242 (from 183) — price parsing against verbatim catalog rows (the `/input/i` regression, tiers, time bands, thinking rows, batch rows), warm scheduling (interval, horizon, prompt floor, in-flight, backoff), payload/URL/usage mapping for all three wire shapes, the telemetry log and its trim, the engine end-to-end against a fake transport, marker injection, and the new `buildCloudModels` options object. Live verification recorded in the spec.
+- New config keys: `cacheWarm.{mode,refreshSeconds,horizonMinutes,minPromptTokens,telemetry}`, `cloudCacheControl`, `costCurrency`, `cnyPerUsd`, `priceTierTokens`, `priceThinkingOutput`, `responsesInputGuard`. `PI_ALIBABA_CACHE_DEBUG=1` logs every warm to stderr. `/alibaba` gains two entries: `Cloud — Cache Warming` and `Cloud — Responses Input Guard: On / Off`.
+- README: new **Prompt cache & warming** section (mechanism, settings table, what a cached turn costs, keeping the prefix stable, the measured context-window table) and a rewritten caching bullet in Limitations. CONTEXT.md: vocabulary for the warm engine, warm template, cache telemetry, price tier, cost unit and cache marker.
+- Tests: 268 (from 183) — price parsing against verbatim catalog rows (the `/input/i` regression, tiers, time bands, thinking rows, batch rows), cap resolution against the measured table (per shape, derived fallbacks, overrides, output caps), warm scheduling (interval, horizon, prompt floor, in-flight, backoff), payload/URL/usage mapping for all three wire shapes, the telemetry log and its trim, the engine end-to-end against a fake transport, marker injection, and the new `buildCloudModels` options object. Live verification recorded in the spec.
 
 ## 2.0.1
 
