@@ -49,6 +49,64 @@ The shared timestamp in `alibaba-config.json` that decides whether a fetch is du
 snapshot does not carry one.
 _Avoid_: TTL
 
+### Prompt cache
+
+**Explicit cache**:
+The DashScope cache block a request opts into — the `x-dashscope-session-cache` header on Responses,
+`cache_control: {"type": "ephemeral"}` markers elsewhere. Deterministic, exact-sized, 5 minutes,
+renewed by a hit; reads at 8.3–10 % of input, the first write at 125 %.
+_Avoid_: session cache (that is the header, not the store), prompt cache
+
+**Implicit cache**:
+The cache DashScope keeps without an opt-in: indeterminate lifetime, 128-token granularity, reads at
+12.5–25 %. A separate store from the explicit one — the two never serve the same request.
+_Avoid_: default cache, background cache
+
+**Warm engine**:
+`extensions/cache-warm.ts`, which keeps a Cloud block alive by replaying the last request. Owns the
+schedule whenever `cacheWarm.mode` is `extension` (the default); `pi` hands it back to the host and
+`off` warms nothing.
+_Avoid_: cache warmer (that is pi's), keep-alive, refresher
+
+**Warm template**:
+The request the engine captured as pi dispatched it — payload plus resolved headers — and replays
+verbatim. One per process, replaced by every real request, dropped when the transcript is rewritten.
+_Avoid_: snapshot, payload copy, cached request
+
+**Refresh**:
+One replay, sent with a 16-token output cap. It either **hits** (the block was alive) or **rewrites**
+it (the block had expired and this request re-created it) — a rewrite is not a failure, it is the
+signal that the interval is too long for that prompt size.
+_Avoid_: warm-up, ping, heartbeat
+
+**Refresh interval / horizon**:
+Seconds between refreshes (default 216, against a 300 s block) and how long the engine keeps going
+after the last real request (default 240 min). The interval is ours to choose; the block's lifetime
+is the provider's.
+_Avoid_: TTL (that is the 5-minute block), period, window
+
+**Cache telemetry**:
+The `alibaba-cache.jsonl` records — one line per turn and per warm, carrying the provider's own
+`cached_tokens` / `cache_creation_input_tokens`, which pi never sees.
+_Avoid_: warm log, cache stats
+
+**Price tier**:
+The size band a tiered model is priced in, chosen by `priceTierTokens` (default 128k). pi holds one
+price per model while DashScope bills per request size, so this is an estimate by construction.
+_Avoid_: range, band, bracket
+
+**Cost unit**:
+What the declared `cost.*` numbers mean: `cny` (the catalog's own unit, which the Bailian console
+bills) or `usd` (converted at `cnyPerUsd`). pi labels them dollars either way, so Status states the
+unit.
+_Avoid_: currency (ambiguous with the conversion rate)
+
+**Cache marker**:
+A `cache_control: {"type": "ephemeral"}` part this extension injects on the Chat Completions shape,
+which has no session-cache header. Two per request at most: the system message and the last markable
+message.
+_Avoid_: breakpoint, cache point
+
 ### Sidecar
 
 **Sidecar**:

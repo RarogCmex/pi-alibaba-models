@@ -14,12 +14,13 @@ import {
   isReasoningModel,
   isVisionModel,
   ownedRows,
-  parseApiV1Prices,
   parseCatalogCache,
   resolveCloudApi,
   supportsCloudResponses,
   thinkingConfigFor,
 } from "../extensions/alibaba.ts";
+import { resolveWarmSettings } from "../extensions/cache-warm.ts";
+import type { CatalogPrices } from "../extensions/prices.ts";
 
 const reasoningQwen = {
   id: "qwen3.7-max",
@@ -68,7 +69,7 @@ describe("thinkingLevelMap", () => {
       "https://plan.example/openai",
       "https://plan.example/anthropic",
     );
-    const [cloud] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
+    const [cloud] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "anthropic-messages" });
 
     assert.deepEqual(plan.thinkingLevelMap, ANTHROPIC_LEVELS);
     assert.deepEqual(cloud.thinkingLevelMap, ANTHROPIC_LEVELS);
@@ -81,7 +82,7 @@ describe("thinkingLevelMap", () => {
       "https://plan.example/openai",
       "https://plan.example/anthropic",
     );
-    const [cloud] = buildCloudModels([nonReasoning], "dashscope.example", "anthropic-messages");
+    const [cloud] = buildCloudModels([nonReasoning], { domain: "dashscope.example", fmt: "anthropic-messages" });
 
     assert.equal(plan.thinkingLevelMap, undefined);
     assert.equal(cloud.thinkingLevelMap, undefined);
@@ -145,8 +146,8 @@ describe("supportsDeveloperRole", () => {
     assert.equal(compatFlags(planOpenAI).supportsDeveloperRole, false);
     assert.equal(compatFlags(planOpenAI).thinkingFormat, "qwen");
 
-    const [cloudAnthropic] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
-    const [cloudOpenAI] = buildCloudModels([reasoningQwen], "dashscope.example", "openai-completions");
+    const [cloudAnthropic] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "anthropic-messages" });
+    const [cloudOpenAI] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "openai-completions" });
 
     assert.equal(cloudAnthropic.api, "anthropic-messages");
     assert.equal(compatFlags(cloudAnthropic).supportsDeveloperRole, undefined);
@@ -159,7 +160,7 @@ describe("supportsDeveloperRole", () => {
 
 describe("openai-responses", () => {
   it("routes Cloud models to compatible-mode/v1 with api openai-responses", () => {
-    const [cloud] = buildCloudModels([reasoningQwen], "dashscope.example", "openai-responses");
+    const [cloud] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "openai-responses" });
     assert.equal(cloud.api, "openai-responses");
     assert.equal(cloud.baseUrl, "https://dashscope.example/compatible-mode/v1");
     assert.equal(compatFlags(cloud).supportsDeveloperRole, false);
@@ -178,8 +179,8 @@ describe("openai-responses", () => {
 
   it("keeps DeepSeek on Chat Completions when the Cloud format is Anthropic", () => {
     const deepseek = { ...reasoningQwen, id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" };
-    const [anthropicFmt] = buildCloudModels([deepseek], "dashscope.example", "anthropic-messages");
-    const [responsesFmt] = buildCloudModels([deepseek], "dashscope.example", "openai-responses");
+    const [anthropicFmt] = buildCloudModels([deepseek], { domain: "dashscope.example", fmt: "anthropic-messages" });
+    const [responsesFmt] = buildCloudModels([deepseek], { domain: "dashscope.example", fmt: "openai-responses" });
     assert.equal(anthropicFmt.api, "openai-completions");
     assert.equal(responsesFmt.api, "openai-responses");
   });
@@ -245,8 +246,8 @@ describe("maxTokens vs API shape", () => {
     // model, so that value is authoritative — never an id-based guess.
     const plus = { ...reasoningQwen, id: "qwen-plus", maxTokens: 32_768 };
     const coder = { ...reasoningQwen, id: "qwen3-coder-plus", maxTokens: 65_536 };
-    const [cloud] = buildCloudModels([plus], "dashscope.example", "anthropic-messages");
-    const [cloudCoder] = buildCloudModels([coder], "dashscope.example", "anthropic-messages");
+    const [cloud] = buildCloudModels([plus], { domain: "dashscope.example", fmt: "anthropic-messages" });
+    const [cloudCoder] = buildCloudModels([coder], { domain: "dashscope.example", fmt: "anthropic-messages" });
     assert.equal(cloud.maxTokens, 32_768);
     assert.equal(cloudCoder.maxTokens, 65_536);
   });
@@ -265,17 +266,9 @@ describe("maxTokens vs API shape", () => {
     // onto the Anthropic path — DashScope rejects overshoots outright with
     // `Range of max_tokens should be [1, N]`. (deepseek is force-routed to
     // Completions anyway; glm-5.1 and kimi-k3 stay on the Anthropic path.)
-    const [glm51] = buildCloudModels(
-      [{ ...reasoningQwen, id: "glm-5.1", maxTokens: 0 }],
-      "dashscope.example",
-      "anthropic-messages",
-    );
+    const [glm51] = buildCloudModels([{ ...reasoningQwen, id: "glm-5.1", maxTokens: 0 }], { domain: "dashscope.example", fmt: "anthropic-messages" });
     assert.equal(glm51.maxTokens, 32_768);
-    const [kimi] = buildCloudModels(
-      [{ ...nonReasoning, id: "kimi-k3", maxTokens: 0 }],
-      "dashscope.example",
-      "anthropic-messages",
-    );
+    const [kimi] = buildCloudModels([{ ...nonReasoning, id: "kimi-k3", maxTokens: 0 }], { domain: "dashscope.example", fmt: "anthropic-messages" });
     assert.equal(kimi.maxTokens, 8_192);
   });
 
@@ -299,8 +292,8 @@ describe("maxTokens vs API shape", () => {
 
   it("keeps catalog maxTokens on OpenAI Completions and Responses", () => {
     const fat = { ...reasoningQwen, maxTokens: 131_072 };
-    const [completions] = buildCloudModels([fat], "dashscope.example", "openai-completions");
-    const [responses] = buildCloudModels([fat], "dashscope.example", "openai-responses");
+    const [completions] = buildCloudModels([fat], { domain: "dashscope.example", fmt: "openai-completions" });
+    const [responses] = buildCloudModels([fat], { domain: "dashscope.example", fmt: "openai-responses" });
     assert.equal(completions.maxTokens, 131_072);
     assert.equal(responses.maxTokens, 131_072);
   });
@@ -339,17 +332,40 @@ describe("per-family capability table", () => {
 });
 
 describe("prompt caching + DashScope session cache", () => {
-  it("declares a 5-minute prompt-cache lifetime on caching-capable families", () => {
-    // DashScope's ephemeral window is 5 minutes and renews on a hit; `short`
-    // is the conservative end of that range and makes the model eligible for
-    // pi's cache warming (global `cacheWarming` setting, default streaming).
-    const [cloud] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
+  it("leaves promptCache undeclared while this extension owns warming", () => {
+    // `promptCache` is the only field pi's cache warmer reads, so declaring it
+    // in the default (extension) mode would run two engines against the same
+    // block. The engine's own schedule comes from config, not from the card.
+    const [cloud] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "anthropic-messages" });
+    assert.equal(cloud.promptCache, undefined);
+  });
+
+  it("declares the TTL that reproduces the refresh interval in mode pi", () => {
+    // pi schedules at min(0.9·ttl, ttl − 10s), so a 270 s refresh is declared
+    // as 300 s — the measured DashScope lifetime.
+    const warm = { ...resolveWarmSettings({}), mode: "pi" as const, refreshSeconds: 270 };
+    const [cloud] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "anthropic-messages", warm });
     assert.deepEqual(cloud.promptCache, { short: 300 });
+  });
+
+  it("leaves the Plan provider on pi's warmer", () => {
+    // The warm engine replays Cloud requests only (its schedule comes from
+    // DashScope's measured TTL and its transport from the Cloud key), so Plan
+    // cards keep the declaration that makes pi's warmer eligible.
+    const [plan] = buildPlanModels(
+      [{ ...reasoningQwen, openaiOnly: false }],
+      "https://plan.example/openai",
+      "https://plan.example/anthropic",
+    );
+    assert.deepEqual(plan.promptCache, { short: 300 });
+    // The Responses input guard is a Cloud Responses fact, not a Plan one.
+    assert.equal(plan.contextWindow, reasoningQwen.contextWindow);
   });
 
   it("declares nothing for the open-weight qwen3-b line (no documented caching)", () => {
     const openWeight = { ...reasoningQwen, id: "qwen3-30b-a3b", maxTokens: 0 };
-    const [cloud] = buildCloudModels([openWeight], "dashscope.example", "anthropic-messages");
+    const warm = { ...resolveWarmSettings({}), mode: "pi" as const };
+    const [cloud] = buildCloudModels([openWeight], { domain: "dashscope.example", fmt: "anthropic-messages", warm });
     assert.equal(cloud.promptCache, undefined);
   });
 
@@ -357,14 +373,70 @@ describe("prompt caching + DashScope session cache", () => {
     // Session cache gives predictable multi-turn prefix hits (5-min window
     // renewed on hit, reads ~10% vs the implicit cache's 20–25%) and is
     // opt-in per request; the docs cover the Responses endpoint only.
-    const [responses] = buildCloudModels([reasoningQwen], "dashscope.example", "openai-responses");
+    const [responses] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "openai-responses" });
     assert.deepEqual((responses as { headers?: Record<string, string> }).headers, {
       "x-dashscope-session-cache": "enable",
     });
-    const [completions] = buildCloudModels([reasoningQwen], "dashscope.example", "openai-completions");
+    const [completions] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "openai-completions" });
     assert.equal((completions as { headers?: Record<string, string> }).headers, undefined);
-    const [anthropic] = buildCloudModels([reasoningQwen], "dashscope.example", "anthropic-messages");
+    const [anthropic] = buildCloudModels([reasoningQwen], { domain: "dashscope.example", fmt: "anthropic-messages" });
     assert.equal((anthropic as { headers?: Record<string, string> }).headers, undefined);
+  });
+});
+
+describe("declared cost and the Responses input guard", () => {
+  const PRICES: CatalogPrices = {
+    input: 12, output: 36, implicitRead: 1.5, explicitRead: 1, explicitWrite: 15,
+    explicitCache: true, tier: "Default", tiered: false, thinkingOutput: false,
+  };
+  const IMPLICIT_ONLY: CatalogPrices = { ...PRICES, explicitRead: 0, explicitWrite: 0, explicitCache: false };
+  const card = { ...reasoningQwen, id: "qwen3.8-max-0902", contextWindow: 1_000_000 };
+  const build = (fmt: string, extra: Record<string, unknown> = {}) =>
+    buildCloudModels([card], {
+      domain: "dashscope.example", fmt,
+      prices: new Map([["qwen3.8-max-0902", extra.implicit ? IMPLICIT_ONLY : PRICES]]),
+      ...extra,
+    })[0];
+
+  it("declares the explicit pair while the session cache is on, the implicit pair without it", () => {
+    assert.deepEqual(build("openai-responses").cost, { input: 12, output: 36, cacheRead: 1, cacheWrite: 15 });
+    assert.deepEqual(build("openai-responses", { sessionCache: false }).cost,
+      { input: 12, output: 36, cacheRead: 1.5, cacheWrite: 0 });
+  });
+
+  it("follows the wire on the other two shapes", () => {
+    // Completions has no header: markers decide, and they are on by default.
+    assert.deepEqual(build("openai-completions").cost, { input: 12, output: 36, cacheRead: 1, cacheWrite: 15 });
+    assert.deepEqual(build("openai-completions", { cacheControl: false }).cost,
+      { input: 12, output: 36, cacheRead: 1.5, cacheWrite: 0 });
+    // pi-ai injects cache_control itself on the Anthropic shape.
+    assert.deepEqual(build("anthropic-messages").cost, { input: 12, output: 36, cacheRead: 1, cacheWrite: 15 });
+  });
+
+  it("never declares an explicit write for a family without explicit rows", () => {
+    assert.deepEqual(build("openai-responses", { implicit: true }).cost,
+      { input: 12, output: 36, cacheRead: 1.5, cacheWrite: 0 });
+  });
+
+  it("converts to USD on request and keeps CNY by default", () => {
+    assert.deepEqual(build("openai-responses", { currency: "usd", cnyPerUsd: 6 }).cost,
+      { input: 2, output: 6, cacheRead: 1 / 6, cacheWrite: 2.5 });
+    assert.deepEqual(build("openai-responses", { currency: "cny" }).cost.input, 12);
+  });
+
+  it("keeps a stored cost when the catalog has no rows for the id", () => {
+    const kept = buildCloudModels([{ ...card, cost: { input: 7, output: 8, cacheRead: 0, cacheWrite: 0 } }],
+      { domain: "dashscope.example", fmt: "openai-responses", prices: new Map() })[0];
+    assert.deepEqual(kept.cost, { input: 7, output: 8, cacheRead: 0, cacheWrite: 0 });
+  });
+
+  it("declares 80% of the window on Responses only, and can be turned off", () => {
+    // The endpoint silently truncates input above ~80% of the context window;
+    // a truncated tail also invalidates the cached prefix for later turns.
+    assert.equal(build("openai-responses").contextWindow, 800_000);
+    assert.equal(build("openai-responses", { responsesInputGuard: false }).contextWindow, 1_000_000);
+    assert.equal(build("anthropic-messages").contextWindow, 1_000_000);
+    assert.equal(build("openai-completions").contextWindow, 1_000_000);
   });
 });
 
@@ -403,21 +475,6 @@ describe("isVisionModel", () => {
 });
 
 describe("native catalog helpers", () => {
-  it("parses Default-range CNY-per-million prices", () => {
-    assert.deepEqual(
-      parseApiV1Prices([
-        {
-          range_name: "Default",
-          prices: [
-            { type: "input", price: "2.4", price_unit: "元/百万Tokens" },
-            { type: "output", price: "9.6", price_unit: "元/百万Tokens" },
-          ],
-        },
-      ]),
-      { input: 2.4, output: 9.6 },
-    );
-  });
-
   it("intersects the catalog with authorized inference models, and keeps the full list if empty", () => {
     const models = [{ id: "qwen3.8-max" }, { id: "glm-5.2" }, { id: "secret-model" }];
     const filtered = applyAuthorizedFilter(models, new Set(["qwen3.8-max", "glm-5.2"]));
@@ -456,18 +513,18 @@ describe("1.5.0: Responses is the default Cloud format", () => {
   }) as any;
 
   it("buildCloudModels defaults to openai-responses with the session-cache header", () => {
-    const [card] = buildCloudModels([def("qwen3.7-plus")], "dashscope-intl.aliyuncs.com", "");
+    const [card] = buildCloudModels([def("qwen3.7-plus")], { domain: "dashscope-intl.aliyuncs.com", fmt: "" });
     assert.equal(card.api, "openai-responses");
     assert.deepEqual(card.headers, { "x-dashscope-session-cache": "enable" });
   });
 
   it("cloudSessionCache=false strips the header (one-shot-heavy usage)", () => {
-    const [card] = buildCloudModels([def("qwen3.7-plus")], "dashscope-intl.aliyuncs.com", "", undefined, false);
+    const [card] = buildCloudModels([def("qwen3.7-plus")], { domain: "dashscope-intl.aliyuncs.com", fmt: "", sessionCache: false });
     assert.equal(card.headers, undefined);
   });
 
   it("session cache stays off non-Responses routes", () => {
-    const [card] = buildCloudModels([def("kimi-k2.6")], "dashscope-intl.aliyuncs.com", "openai-responses");
+    const [card] = buildCloudModels([def("kimi-k2.6")], { domain: "dashscope-intl.aliyuncs.com", fmt: "openai-responses" });
     assert.equal(card.api, "openai-completions"); // no Responses support -> fallback
     assert.equal(card.headers, undefined);
   });

@@ -24,6 +24,33 @@ import {
 } from "./tool-presentation.ts";
 import { classifyStreamError, rewriteFromStreamError, type StreamErrorClass } from "./stream-errors.ts";
 import {
+  convertCost,
+  DEFAULT_CNY_PER_USD,
+  DEFAULT_TIER_TOKENS,
+  declareCacheCost,
+  formatCacheEconomics,
+  parseCatalogPrices,
+  type CatalogPrices,
+  type CatalogPriceRange,
+} from "./prices.ts";
+import {
+  appendCacheLog,
+  cacheFieldsFromStreamEvent,
+  createCacheWarmer,
+  DASHSCOPE_CACHE_TTL_SECONDS,
+  declaredCacheTtlSeconds,
+  DEFAULT_WARM_SETTINGS,
+  readCacheLog,
+  resolveWarmSettings,
+  summarizeCacheLog,
+  warmingDecisionOverride,
+  type CacheWarmer,
+  type CacheUsage,
+  type WarmMode,
+  type WarmSettings,
+} from "./cache-warm.ts";
+import { injectCacheControl } from "./cache-control.ts";
+import {
   ALIBABA_TOOLS_PARAMETERS,
   buildSidecarRequest,
   dashScopeErrorMessage,
@@ -74,6 +101,9 @@ const AUTH_PATH = path.join(HOME_DIR, "auth.json");
 // registration at boot with zero network and keeps the extension independent
 // of pi's models-store semantics. pi's store stays as a bonus channel.
 const CATALOG_CACHE_PATH = path.join(HOME_DIR, "alibaba-models.cache.json");
+// Prompt-cache telemetry: one JSON line per turn and per warm, written by the
+// warming engine and read back by /alibaba → Status and Cache statistics.
+const CACHE_LOG_PATH = path.join(HOME_DIR, "alibaba-cache.jsonl");
 // Model catalogs live in pi's own models store: `refreshModels` returns them,
 // pi persists the snapshot and hands it back as `context.stored` for
 // offline/cache-only initialization. The extension's own cache files are gone
@@ -205,6 +235,34 @@ interface AlibabaConfig {
   planFetchedAt?: number;
   cloudFetchedAt?: number;
   cloudAuthorizedFilteredLast?: boolean;
+  // ── Prompt cache ────────────────────────────────────────────────────
+  // Cache warming for Cloud sessions; see extensions/cache-warm.ts for why the
+  // default is an engine of our own rather than pi's. Absent = defaults
+  // (`extension`, 216 s refresh, 4 h horizon, 20k-token floor, telemetry on).
+  cacheWarm?: {
+    mode?: "off" | "pi" | "extension";
+    refreshSeconds?: number;
+    horizonMinutes?: number;
+    minPromptTokens?: number;
+    telemetry?: boolean;
+  };
+  // Inject `cache_control: {type: "ephemeral"}` on the Chat Completions shape
+  // for models whose catalog rows include explicit-cache prices. Default true.
+  cloudCacheControl?: boolean;
+  // Unit of the declared `cost.*` numbers. The catalog bills CNY per million
+  // while pi labels them dollars: "cny" (default) keeps the console's numbers,
+  // "usd" converts at `cnyPerUsd`.
+  costCurrency?: "cny" | "usd";
+  cnyPerUsd?: number;
+  // Prompt size used to pick a price tier for the 43 tiered catalog models
+  // (default 128k), and whether a model with separate thinking-mode prices is
+  // billed as thinking (default true — pi runs reasoning models with a level).
+  priceTierTokens?: number;
+  priceThinkingOutput?: boolean;
+  // The Responses endpoint silently truncates input above ~80% of the context
+  // window; declaring the usable size makes pi compact before that happens.
+  // Default true.
+  responsesInputGuard?: boolean;
 }
 
 // How one of the two Alibaba tools is exposed to the model. `codemode` is the
@@ -569,14 +627,26 @@ function capsFor(id: string): FamilyCaps {
 // DashScope prompt caching (help.aliyun.com/zh/model-studio/context-cache):
 // implicit caching is on for these families, and the explicit
 // `cache_control: {type: "ephemeral"}` window is 5 minutes, renewed on a hit —
-// no longer tier is published. `short: 300` is the conservative end of that
-// window; it makes the model eligible for pi's cache warming (the global
-// `cacheWarming` setting decides off/streaming/idle). `long` stays unset —
-// there is no published 1h-class lifetime. The open-weight qwen3-<size>b line
-// has no caching at all and unknown families stay ineligible.
-const PROMPT_CACHE: NonNullable<ChatModelConfig["promptCache"]> = { short: 300 };
-const promptCacheFor = (id: string): ChatModelConfig["promptCache"] =>
-  capsFor(id).cache ? PROMPT_CACHE : undefined;
+// no longer tier is published (measured: docs/notes/2026-10-07-dashscope-cache-
+// ttl-and-warming.md). `long` stays unset — there is no published 1h-class
+// lifetime. The open-weight qwen3-<size>b line has no caching at all and
+// unknown families stay ineligible.
+//
+// `promptCache` is the *only* field pi's cache warmer reads, so it is also the
+// switch between warming engines: mode `pi` declares the TTL whose 0.9·ttl
+// schedule reproduces the configured refresh interval, while `extension` (the
+// default) and `off` declare nothing and pi's warmer stays out of the way —
+// two engines refreshing the same block would only burn quota.
+const promptCacheFor = (id: string, warm: WarmSettings): ChatModelConfig["promptCache"] => {
+  if (!capsFor(id).cache || warm.mode !== "pi") return undefined;
+  return { short: declaredCacheTtlSeconds(warm.refreshSeconds) };
+};
+
+// Plan keeps pi's own warmer: this extension's engine captures Cloud requests
+// only (its replay depends on DashScope's measured TTL and on the Cloud
+// credential), so the Plan card still declares the 5-minute lifetime.
+const planPromptCacheFor = (id: string): ChatModelConfig["promptCache"] =>
+  capsFor(id).cache ? { short: DASHSCOPE_CACHE_TTL_SECONDS } : undefined;
 
 const OPENAI_BASE_COMPAT = {
   thinkingFormat: "qwen" as const,
@@ -717,7 +787,7 @@ export function buildPlanModels(
       id: m.id, name: m.name,
       ...deriveCard(m.id, m, overrides),
       maxTokens: resolveMaxTokens(m.id, api, m.catalogMaxTokens),
-      promptCache: promptCacheFor(m.id),
+      promptCache: planPromptCacheFor(m.id),
       compat: mergeCompat(m.compat, tc, useOpenAI),
       thinkingLevelMap: tc?.thinkingLevelMap,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -738,25 +808,18 @@ interface ApiV1Model {
     context_window?: number | null;
     max_output_tokens?: number | null;
   };
-  prices?: Array<{
-    range_name?: string;
-    prices?: Array<{ type?: string; price?: string; price_unit?: string }>;
-  }>;
+  prices?: CatalogPriceRange[];
 }
 
-export function parseApiV1Prices(prices: ApiV1Model["prices"]): { input: number; output: number } {
-  const out = { input: 0, output: 0 };
-  if (!prices?.length) return out;
-  const range = prices.find((p) => p.range_name === "Default") ?? prices[0];
-  for (const item of range?.prices ?? []) {
-    if (!item.type || !item.price || !/百万/i.test(item.price_unit ?? "")) continue;
-    const n = Number(item.price);
-    if (!Number.isFinite(n) || n <= 0) continue;
-    if (/input/i.test(item.type)) out.input = n;
-    else if (/output/i.test(item.type)) out.output = n;
-  }
-  return out;
-}
+// Raw catalog prices per model id, filled by the last real fetch and seeded
+// from the private snapshot at boot. `buildCloudModels` turns them into the
+// declared `cost` — the declaration depends on the session-cache header, the
+// Completions markers and the currency setting, all of which can change without
+// a refetch, so the raw numbers are what gets kept.
+const cloudPrices = new Map<string, CatalogPrices>();
+
+/** Price rows of one catalog model, or undefined when the catalog had none. */
+export const cloudPricesFor = (id: string): CatalogPrices | undefined => cloudPrices.get(id);
 
 export function applyAuthorizedFilter<T extends { id: string }>(
   models: T[],
@@ -774,6 +837,7 @@ async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<ChatM
   try {
     const models: ChatModelConfig[] = [];
     const exclude = /(image|audio|video|tts|asr|embed|vector|rerank|wan|omni|livetranslate|realtime|3d|face)/i;
+    const cfg = loadConfig();
     for (let page = 1; page <= 5; page++) {
       const params = new URLSearchParams({ capabilities: "TG", page_no: String(page), page_size: "100" });
       const res = await fetch(`https://${domain}/api/v1/models?${params}`, {
@@ -784,14 +848,18 @@ async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<ChatM
       const json = (await res.json()) as { output?: { total?: number; models?: ApiV1Model[] } };
       const output = json.output;
       if (!output?.models?.length) break;
-      const overrides = loadConfig().contextWindowOverrides;
+      const overrides = cfg.contextWindowOverrides;
       for (const m of output.models) {
         if (!m.model || exclude.test(m.model)) continue;
         const caps = m.capabilities ?? [];
         const reqMod = m.inference_metadata?.request_modality ?? [];
         const ctx = m.model_info?.context_window;
         const maxOut = m.model_info?.max_output_tokens;
-        const price = parseApiV1Prices(m.prices);
+        const prices = parseCatalogPrices(m.prices, {
+          tierTokens: cfg.priceTierTokens,
+          thinkingOutput: cfg.priceThinkingOutput !== false,
+        });
+        if (prices.input > 0 || prices.output > 0) cloudPrices.set(m.model, prices);
         models.push({
           id: m.model,
           name: m.name || m.model,
@@ -802,7 +870,9 @@ async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<ChatM
           input: isVisionModel(m.model) || reqMod.includes("Image") || caps.includes("VU")
             ? (["text", "image"] as ("text" | "image")[])
             : (["text"] as ("text" | "image")[]),
-          cost: { input: price.input, output: price.output, cacheRead: 0, cacheWrite: 0 },
+          // Raw CNY here; buildCloudModels applies the cache and currency policy
+          // at registration time, so a setting change needs no refetch.
+          cost: { input: prices.input, output: prices.output, cacheRead: 0, cacheWrite: 0 },
           contextWindow: typeof ctx === "number" && ctx > 0 ? ctx : inferContextWindow(m.model, overrides),
           // 0 = "the catalog has no max_output_tokens row". A guessed ceiling
           // must never masquerade as a catalog value here — resolveMaxTokens
@@ -1012,31 +1082,95 @@ export function countFallbackModels(models: { id: string }[], fmt: CloudApiForma
   return models.filter((m) => resolveCloudApi(m.id, fmt) !== fmt).length;
 }
 
+// The Responses endpoint accepts at most ~80% of the model's context window as
+// input and **silently truncates** the rest (alibabacloud.com/help/en/model-
+// studio/qwen-api-via-openai-responses). Declaring the usable size makes pi
+// compact before that happens; a truncated tail also destroys the cached prefix
+// for every later turn.
+export const RESPONSES_INPUT_FRACTION = 0.8;
+
+/** Everything `buildCloudModels` needs that is not the catalog itself. */
+export interface CloudModelBuildOptions {
+  domain: string;
+  fmt: string;
+  overrides?: Record<string, number>;
+  /** Session-cache header on Responses requests. Default true. */
+  sessionCache?: boolean;
+  /** `cache_control` markers on Completions requests. Default true. */
+  cacheControl?: boolean;
+  /** Warming settings; only `mode`/`refreshSeconds` reach the model card. */
+  warm?: WarmSettings;
+  /** Unit of the declared `cost.*`. Default "cny" (what the console bills). */
+  currency?: "cny" | "usd";
+  cnyPerUsd?: number;
+  /** Raw catalog prices; defaults to the map filled by the last fetch. */
+  prices?: ReadonlyMap<string, CatalogPrices>;
+  /** Declare 80% of the catalog window on Responses models. Default true. */
+  responsesInputGuard?: boolean;
+}
+
+/**
+ * Which cache the wire will use for one model on one shape: the session-cache
+ * header on Responses, pi-ai's own `cache_control` injection on the Anthropic
+ * shape, our markers on Completions. Declaring the wrong pair would misprice
+ * every turn — reads at 8.3 % vs 12.5 %, writes at 125 % vs 100 %.
+ */
+export function explicitCacheActive(api: string, sessionCache: boolean, cacheControl: boolean): boolean {
+  if (api === "anthropic-messages") return true;
+  if (api === "openai-responses") return sessionCache;
+  return cacheControl;
+}
+
 export function buildCloudModels(
   models: ChatModelConfig[],
-  domain: string,
-  fmt: string,
-  overrides?: Record<string, number>,
-  sessionCache = true,
+  opts: CloudModelBuildOptions,
 ): ChatModelConfig[] {
-  const format = (fmt as CloudApiFormat) || DEFAULT_CLOUD_FORMAT;
+  const format = (opts.fmt as CloudApiFormat) || DEFAULT_CLOUD_FORMAT;
+  const domain = opts.domain;
+  const sessionCache = opts.sessionCache !== false;
+  const cacheControl = opts.cacheControl !== false;
+  const warm = opts.warm ?? DEFAULT_WARM_SETTINGS;
+  const prices = opts.prices ?? cloudPrices;
+  const currency = opts.currency === "usd" ? "usd" : "cny";
+  const guard = opts.responsesInputGuard !== false;
   return models.map((m) => {
     const api = resolveCloudApi(m.id, format);
     const tc = thinkingConfigFor(m.id, api);
     const openai = api !== "anthropic-messages";
+    const card = deriveCard(m.id, m, opts.overrides);
+    const raw = prices.get(m.id);
+    // Which cache the wire will actually use, per shape: the header on
+    // Responses, pi-ai's own `cache_control` injection on the Anthropic shape,
+    // our markers on Completions. Declaring the wrong pair would misprice every
+    // turn — reads at 8.3% vs 12.5%, writes at 125% vs 100%.
+    const explicit = !!raw?.explicitCache && explicitCacheActive(api, sessionCache, cacheControl);
+    // Without catalog rows (compatible-mode fallback, login seed) the fetch-time
+    // numbers stand; recomputing them from nothing would zero a stored cost.
+    const cost = raw
+      ? convertCost(
+          { input: raw.input, output: raw.output, ...declareCacheCost(raw, explicit) },
+          currency,
+          opts.cnyPerUsd ?? DEFAULT_CNY_PER_USD,
+        )
+      : m.cost;
     return {
       ...m,
-      ...deriveCard(m.id, m, overrides),
+      ...card,
+      contextWindow: guard && api === "openai-responses"
+        ? Math.floor(card.contextWindow * RESPONSES_INPUT_FRACTION)
+        : card.contextWindow,
+      cost,
       maxTokens: resolveMaxTokens(m.id, api, m.maxTokens),
-      promptCache: promptCacheFor(m.id),
+      promptCache: promptCacheFor(m.id, warm),
       thinkingLevelMap: tc?.thinkingLevelMap,
       compat: mergeCompat(m.compat, tc, openai),
       // DashScope's session cache makes multi-turn prefix hits predictable on
-      // Responses (5-min window renewed on hit, reads billed at ~10% instead
-      // of the implicit cache's indeterminate TTL and 20–25% reads) and is
-      // opt-in per request. Models re-routed to Completions stay unmarked, and
-      // cloudSessionCache=false strips the header entirely (one-shot-heavy
-      // usage: cache writes cost 125% of input and may never be re-read).
+      // Responses (5-min window renewed on hit, reads billed at 8.3% instead of
+      // the implicit cache's indeterminate TTL and 12.5–25% reads) and is opt-in
+      // per request. Models re-routed to Completions get markers instead (see
+      // cache-control.ts), and cloudSessionCache=false strips the header
+      // entirely (one-shot-heavy usage: writes cost 125% of input and may never
+      // be re-read).
       headers: api === "openai-responses" && sessionCache ? { "x-dashscope-session-cache": "enable" } : undefined,
       baseUrl: openai ? `https://${domain}/compatible-mode/v1` : `https://${domain}/apps/anthropic`,
       api,
@@ -1535,7 +1669,11 @@ const releaseCatalogLock = () => { try { fs.unlinkSync(CATALOG_LOCK_PATH); } cat
 interface CatalogCache {
   v: 2;
   plan?: { fetchedAt: number; models: PlanModelDef[] };
-  cloud?: { fetchedAt: number; models: ChatModelConfig[] };
+  // `prices` carries the raw catalog rows per model id, so a boot with no
+  // network can still declare cache and currency policy. Optional: an older
+  // snapshot without it is valid, it just declares no cache prices until the
+  // next fetch.
+  cloud?: { fetchedAt: number; models: ChatModelConfig[]; prices?: Record<string, CatalogPrices> };
   // Curated image rows (the native IG listing, already filtered). Optional:
   // an older v2 snapshot without them is still valid, just image-less offline.
   cloudImages?: { fetchedAt: number; models: ImageCatalogRow[] };
@@ -1564,6 +1702,9 @@ function seedFromSnapshot() {
   if (!planDefs.length && cache?.plan?.models?.length) planDefs = cache.plan.models;
   if ((!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) && cache?.cloud?.models?.length) {
     cloudDefs = cache.cloud.models;
+    for (const [id, p] of Object.entries(cache.cloud.prices ?? {})) {
+      if (p && typeof p === "object" && !cloudPrices.has(id)) cloudPrices.set(id, p);
+    }
   }
   // Presence of the `cloudImages` section counts as "already fetched", even when
   // the curated filter emptied it — otherwise an account with no image models
@@ -1627,7 +1768,14 @@ async function loadCloudCatalog(domain: string, apiKey: string, force: boolean):
     cfg.cloudAuthorizedFilteredLast = authorizedOnly;
     saveConfig(cfg);
     const patch: Partial<CatalogCache> = {};
-    if (models.length) patch.cloud = { fetchedAt: cfg.cloudFetchedAt, models };
+    if (models.length) {
+      const prices: Record<string, CatalogPrices> = {};
+      for (const m of models) {
+        const p = cloudPrices.get(m.id);
+        if (p) prices[m.id] = p;
+      }
+      patch.cloud = { fetchedAt: cfg.cloudFetchedAt, models, prices };
+    }
     if (imageFetched) patch.cloudImages = { fetchedAt: cfg.cloudFetchedAt, models: cloudImageDefs };
     if (Object.keys(patch).length) updateCatalogCache(patch);
     return { defs, fetched: models.length > 0 };
@@ -1641,24 +1789,32 @@ async function loadCloudCatalog(domain: string, apiKey: string, force: boolean):
 
 // Register-time model list: chat cards first, then the image cards. Supplying
 // `models` replaces the provider's models across every operation, so the two
-// builders merge here and the provider registers one mixed list. The four
-// build knobs travel as one object instead of four positional params.
-interface CloudBuildOptions {
-  domain: string;
-  fmt: string;
-  overrides?: Record<string, number>;
-  sessionCache?: boolean;
-}
-
+// builders merge here and the provider registers one mixed list.
 function buildCloudModelList(
   chat: ChatModelConfig[],
   images: ImageCatalogRow[],
-  opts: CloudBuildOptions,
+  opts: CloudModelBuildOptions,
 ): PiModelConfig[] {
   return [
-    ...buildCloudModels(chat, opts.domain, opts.fmt, opts.overrides, opts.sessionCache ?? true),
+    ...buildCloudModels(chat, opts),
     ...buildImageModels(images, opts.domain),
   ];
+}
+
+// The one place config becomes build options, so registration, refresh and the
+// login-seed path cannot drift apart.
+function cloudBuildOptions(cfg: AlibabaConfig, domain: string, fmt: string): CloudModelBuildOptions {
+  return {
+    domain,
+    fmt,
+    overrides: cfg.contextWindowOverrides,
+    sessionCache: cfg.cloudSessionCache !== false,
+    cacheControl: cfg.cloudCacheControl !== false,
+    warm: resolveWarmSettings(cfg.cacheWarm ?? {}),
+    currency: cfg.costCurrency === "usd" ? "usd" : "cny",
+    cnyPerUsd: cfg.cnyPerUsd,
+    responsesInputGuard: cfg.responsesInputGuard !== false,
+  };
 }
 
 // What pi calls. The offline phase re-serves the stored snapshot through the
@@ -1706,12 +1862,8 @@ const cloudRefreshModels = async (context: RefreshCtx): Promise<PiModelConfig[]>
   const heldImages = cloudImageDefs.length
     ? cloudImageDefs
     : (imageRows(owned) as unknown as ImageCatalogRow[]);
-  const buildOptions: CloudBuildOptions = {
-    domain, fmt,
-    overrides: cfg.contextWindowOverrides,
-    sessionCache: cfg.cloudSessionCache !== false,
-  };
-  if (!key) return buildCloudModels(CLOUD_LOGIN_SEED, domain, fmt, cfg.contextWindowOverrides, cfg.cloudSessionCache !== false);
+  const buildOptions = cloudBuildOptions(cfg, domain, fmt);
+  if (!key) return buildCloudModels(CLOUD_LOGIN_SEED, buildOptions);
   if (!context.allowNetwork) {
     if (!cloudDefs.length || cloudDefs === CLOUD_LOGIN_SEED) cloudDefs = held;
     if (!cloudImageDefs.length) cloudImageDefs = heldImages;
@@ -1893,11 +2045,7 @@ function registerCloudProvider(pi: ExtensionAPI) {
     // One mixed list: supplying `models` replaces this provider's models across
     // chat, image, and classifier operations, so the image cards must ride here
     // or they would erase the chat models (custom-provider.md).
-    models: buildCloudModelList(cloudDefs, cloudImageDefs, {
-      domain, fmt,
-      overrides: cfg.contextWindowOverrides,
-      sessionCache: cfg.cloudSessionCache !== false,
-    }),
+    models: buildCloudModelList(cloudDefs, cloudImageDefs, cloudBuildOptions(cfg, domain, fmt)),
     // Keyed by the `api` the image cards declare; pi forwards the resolved
     // Cloud key and the tool's `metadata` here unchanged.
     images: { [IMAGE_API]: { generateImages: generateDashScopeImages } },
@@ -2015,6 +2163,230 @@ function registerAlibabaTools(pi: ExtensionAPI, cfg: AlibabaConfig, imageDeps: I
   if (imageExposure !== "off") registerImageTool(pi, imageExposure, imageDeps);
 }
 
+// ── /alibaba → Cloud — Cache Warming ─────────────────────────────────────
+// The knobs of extensions/cache-warm.ts, in one page. Warming is a latency
+// mechanism here, so the labels say what each value buys in seconds of margin
+// against the measured 5-minute TTL rather than what it costs.
+const WARM_MODE_LABELS: Record<WarmMode, string> = {
+  extension: "extension — this plugin's engine (default): no dollar gate, keeps warming for hours",
+  pi: "pi — pi's own warmer: expected-savings gate, stops 30 min idle / 60 min streaming",
+  off: "off — no warming: every pause longer than 5 min pays a cold prefix",
+};
+
+const REFRESH_PRESETS = [
+  { value: 150, label: "150 s — 150 s of margin, 24 refreshes/h" },
+  { value: 216, label: "216 s — 84 s of margin, 17 refreshes/h (default)" },
+  { value: 270, label: "270 s — 30 s of margin, 13 refreshes/h (pi-like)" },
+];
+const HORIZON_PRESETS = [
+  { value: 60, label: "1 hour" },
+  { value: 240, label: "4 hours (default)" },
+  { value: 480, label: "8 hours" },
+  { value: 1440, label: "24 hours" },
+];
+const MIN_PROMPT_PRESETS = [
+  { value: 0, label: "0 — warm every prompt" },
+  { value: 20_000, label: "20 000 tokens (default)" },
+  { value: 100_000, label: "100 000 tokens — only the prompts whose cold start hurts" },
+];
+const CUSTOM = "Custom…";
+
+// Menu items carry a "• " marker on the current value, so a selection is
+// matched on its label text, never on a prefix.
+const unbullet = (s: string): string => s.replace(/^[\s•]+/, "");
+
+/**
+ * One preset pick: returns the chosen value, `null` for "Custom…", and
+ * undefined when the user dismissed the list.
+ */
+async function pickPreset<T>(
+  ctx: ExtensionCommandContext,
+  title: string,
+  items: { value: T; label: string }[],
+  current: T,
+): Promise<T | null | undefined> {
+  const labels = [...items.map((i) => `${i.value === current ? "• " : "  "}${i.label}`), CUSTOM];
+  const sel = await ctx.ui.select(title, labels);
+  if (!sel) return undefined;
+  const text = unbullet(sel);
+  if (text === CUSTOM) return null;
+  return items.find((i) => i.label === text)?.value;
+}
+
+// Status lines: what the cache is set up to do, and what it actually did.
+function cacheStatusLines(cfg: AlibabaConfig, warmer: CacheWarmer, logPath: string): string[] {
+  const s = resolveWarmSettings(cfg.cacheWarm ?? {});
+  const st = warmer.status();
+  const engine = s.mode === "off"
+    ? "off"
+    : s.mode === "pi"
+      ? `pi (~${s.refreshSeconds}s refresh, pi's 30 min idle / 60 min streaming caps)`
+      : `extension (${s.refreshSeconds}s refresh, ${s.horizonMinutes}m horizon, ≥${s.minPromptTokens.toLocaleString("en-US")} tokens)`;
+  const live = s.mode === "extension"
+    ? st.running
+      ? ` — next warm in ${Math.max(0, Math.round(((st.nextWarmAt ?? Date.now()) - Date.now()) / 1000))}s`
+      : ` — idle (${st.reason ?? "no request captured yet"})`
+    : "";
+  const counters = st.warms ? `; ${st.warms} warms: ${st.hits} hits, ${st.rewrites} late, ${st.failures} failed` : "";
+  const currency = cfg.costCurrency === "usd" ? "usd" : "cny";
+  const unit = currency === "usd"
+    ? `USD/M (÷${cfg.cnyPerUsd || DEFAULT_CNY_PER_USD})`
+    : "CNY/M (pi labels it $)";
+  const lines = [
+    `       Warming:   ${engine}${live}${counters}`,
+    `       Prices:    ${unit}, tier probe ${(cfg.priceTierTokens ?? DEFAULT_TIER_TOKENS).toLocaleString("en-US")} tokens, ` +
+      `thinking output ${cfg.priceThinkingOutput === false ? "off" : "on"}`,
+  ];
+  const sum = summarizeCacheLog(readCacheLog(logPath));
+  if (sum.turns || sum.warms) {
+    lines.push(
+      `       Cache log: ${sum.turns} turn${sum.turns === 1 ? "" : "s"}, ${sum.hitRatePct ?? 0}% hit — ` +
+      `${sum.cachedTokens.toLocaleString("en-US")} cached vs ${sum.missedTokens.toLocaleString("en-US")} cold tokens`,
+    );
+  }
+  return lines;
+}
+
+// One line for the model in use: a switch to a family without explicit-cache
+// rows silently changes what a cached turn costs, and this is where it shows.
+function modelCacheLine(
+  model: { provider?: string; id?: string; api?: string } | undefined,
+  cfg: AlibabaConfig,
+): string | undefined {
+  if (model?.provider !== "alibaba-cloud" || !model.id) return undefined;
+  const prices = cloudPricesFor(model.id);
+  if (!prices) return undefined;
+  const explicit = explicitCacheActive(
+    model.api ?? "",
+    cfg.cloudSessionCache !== false,
+    cfg.cloudCacheControl !== false,
+  );
+  const tier = prices.tiered ? `, tier ${prices.tier}` : "";
+  return `       Model:     ${model.id} — ${formatCacheEconomics(prices, explicit, cfg.costCurrency === "usd" ? "usd" : "cny")}${tier}`;
+}
+
+async function cacheWarmMenu(ctx: ExtensionCommandContext, warmer: CacheWarmer, logPath: string): Promise<void> {
+  let dirty = false;
+  const patch = (p: Partial<NonNullable<AlibabaConfig["cacheWarm"]>>) => {
+    const cfg = loadConfig();
+    cfg.cacheWarm = { ...resolveWarmSettings(cfg.cacheWarm ?? {}), ...p };
+    saveConfig(cfg);
+    dirty = true;
+  };
+  const preset = async <T,>(
+    title: string,
+    items: { value: T; label: string }[],
+    current: T,
+    customTitle: string,
+  ): Promise<T | undefined> => {
+    const picked = await pickPreset(ctx, title, items, current);
+    if (picked !== null) return picked ?? undefined;
+    const custom = await askNumber(customTitle, String(current));
+    return custom === undefined ? undefined : (Math.round(custom) as T);
+  };
+  const askNumber = async (title: string, placeholder: string): Promise<number | undefined> => {
+    const raw = await ctx.ui.input(title, placeholder);
+    if (raw === undefined || !raw.trim()) return undefined;
+    const n = Number(raw.trim());
+    if (!Number.isFinite(n) || n < 0) { ctx.ui.notify(`Not a number: ${raw}`, "error"); return undefined; }
+    return n;
+  };
+
+  for (;;) {
+    const cfg = loadConfig();
+    const s = resolveWarmSettings(cfg.cacheWarm ?? {});
+    const st = warmer.status();
+    const state = st.running
+      ? `arming${st.nextWarmAt ? `, next in ${Math.max(0, Math.round((st.nextWarmAt - Date.now()) / 1000))}s` : ""}`
+      : `idle (${st.reason ?? "no request captured yet"})`;
+    const choice = await ctx.ui.select(
+      `Cache warming — ${s.mode}, refresh ${s.refreshSeconds}s, horizon ${s.horizonMinutes}m, ≥${s.minPromptTokens.toLocaleString("en-US")} tokens\n` +
+      `Engine: ${state}; ${st.warms} warms (${st.hits} hits, ${st.rewrites} rewrites, ${st.failures} failed)`,
+      [
+        "Engine…",
+        "Refresh interval…",
+        "Horizon (how long to keep warming)…",
+        "Minimum prompt size…",
+        "Telemetry log (alibaba-cache.jsonl)",
+        "Warm now",
+        "Cache statistics",
+        "Done",
+      ],
+    );
+    if (!choice || choice === "Done") break;
+
+    if (choice === "Engine…") {
+      const items = ["extension", "pi", "off"].map((m) => ({ value: m as WarmMode, label: WARM_MODE_LABELS[m as WarmMode] }));
+      const mode = await pickPreset(ctx, "Who keeps the Cloud prompt cache alive?", items, s.mode);
+      if (mode) patch({ mode });
+      continue;
+    }
+    if (choice === "Refresh interval…") {
+      const v = await preset(
+        "Seconds between refreshes (the block lives 300 s):",
+        REFRESH_PRESETS, s.refreshSeconds, "Custom refresh seconds (60–270):",
+      );
+      if (v !== undefined) patch({ refreshSeconds: v });
+      continue;
+    }
+    if (choice.startsWith("Horizon")) {
+      const v = await preset(
+        "Keep warming this long after the last request:",
+        HORIZON_PRESETS, s.horizonMinutes, "Custom horizon in minutes (1–1440):",
+      );
+      if (v !== undefined) patch({ horizonMinutes: v });
+      continue;
+    }
+    if (choice.startsWith("Minimum prompt")) {
+      const v = await preset(
+        "Skip prompts smaller than:",
+        MIN_PROMPT_PRESETS, s.minPromptTokens, "Custom minimum prompt tokens:",
+      );
+      if (v !== undefined) patch({ minPromptTokens: v });
+      continue;
+    }
+    if (choice.startsWith("Telemetry")) {
+      patch({ telemetry: !s.telemetry });
+      ctx.ui.notify(`Cache telemetry ${s.telemetry ? "off" : `on → ${logPath}`}`, "info");
+      continue;
+    }
+    if (choice === "Warm now") {
+      const res = await warmer.warmNow();
+      if (!res) { ctx.ui.notify("Nothing to warm yet: no Cloud request has been sent in this session.", "warning"); continue; }
+      ctx.ui.notify(
+        res.ok
+          ? `Warm ${res.rewrote ? "re-created an expired block" : "hit"}: ` +
+            `${(res.usage?.cached ?? 0).toLocaleString("en-US")} cached, ` +
+            `${(res.usage?.creation ?? 0).toLocaleString("en-US")} created, ${Math.round(res.ms)}ms`
+          : `Warm failed: ${res.error ?? `HTTP ${res.status}`}`,
+        res.ok ? "info" : "error",
+      );
+      continue;
+    }
+    if (choice === "Cache statistics") {
+      const sum = summarizeCacheLog(readCacheLog(logPath));
+      if (!sum.turns && !sum.warms) { ctx.ui.notify(`No records in ${logPath} yet.`, "info"); continue; }
+      const span = sum.first && sum.last ? `${new Date(sum.first).toISOString().slice(5, 16)} → ${new Date(sum.last).toISOString().slice(5, 16)}` : "";
+      ctx.ui.notify(
+        [
+          `Cache telemetry ${span}`,
+          `Turns:  ${sum.turns} — ${sum.turnHits} hit / ${sum.turnMisses} cold` +
+            (sum.hitRatePct === null ? "" : ` (${sum.hitRatePct}%)`),
+          `Tokens: ${sum.cachedTokens.toLocaleString("en-US")} cached, ${sum.missedTokens.toLocaleString("en-US")} re-read at full price`,
+          `Warms:  ${sum.warms} — ${sum.warmHits} hits, ${sum.warmRewrites} arrived after expiry, ${sum.warmFailures} failed`,
+          sum.warmRewrites ? "Rewrites mean the refresh interval is too long for this prompt size." : "",
+        ].filter(Boolean).join("\n"),
+        "info",
+      );
+      continue;
+    }
+  }
+  if (dirty) {
+    ctx.ui.notify("Cache warming settings saved.", "info");
+    await ctx.reload();
+  }
+}
+
 export default async function (pi: ExtensionAPI) {
   // Refuse to run next to another configured copy of this plugin. pi resolves
   // the resulting `alibaba-cloud` registration collision last-wins, so the
@@ -2034,7 +2406,7 @@ export default async function (pi: ExtensionAPI) {
   // registering a half-working provider.
   if (!hostVersionSupported(VERSION)) {
     throw new Error(
-      `pi-alibaba-models 2.0.1 requires pi 1.0.0 or newer (found ${VERSION}). ` +
+      `pi-alibaba-models 2.1.0 requires pi 1.0.0 or newer (found ${VERSION}). ` +
       `Stay on pi-alibaba-models 1.5.3 for older hosts.`,
     );
   }
@@ -2049,11 +2421,122 @@ export default async function (pi: ExtensionAPI) {
   // the wording-based matchers cannot recognize the turn, and the text matchers
   // stay as the fallback for turns where no raw event was seen.
   const streamErrorByModel = new Map<string, StreamErrorClass>();
+  // Raw cache counters of the response being streamed, per provider/model.
+  // pi normalizes usage before `message_end` and drops the creation counters
+  // (DashScope reports them only in `usage.x_details[].prompt_tokens_details`),
+  // so the raw event is the only place they exist.
+  const cacheFieldsByModel = new Map<string, CacheUsage>();
   pi.on("provider_stream_event", (event) => {
     if (event.provider !== "alibaba-plan" && event.provider !== "alibaba-cloud") return;
     const cls = classifyStreamError(event.data);
     if (cls) streamErrorByModel.set(`${event.provider}/${event.model}`, cls);
+    if (event.provider !== "alibaba-cloud") return;
+    const fields = cacheFieldsFromStreamEvent(event.api, event.data);
+    if (fields) cacheFieldsByModel.set(`${event.provider}/${event.model}`, fields);
   });
+
+  // ── Prompt cache: warming, markers, telemetry (Cloud) ────────────────
+  const warmSettings = (): WarmSettings => resolveWarmSettings(loadConfig().cacheWarm ?? {});
+  const warmer: CacheWarmer = createCacheWarmer({
+    settings: warmSettings,
+    logFile: () => CACHE_LOG_PATH,
+    log: process.env.PI_ALIBABA_CACHE_DEBUG === "1" ? (line) => console.error(line) : undefined,
+  });
+  // Headers of the request being dispatched. `before_provider_headers` fires
+  // first (pi-ai resolves auth, then builds the payload), and the object pi
+  // hands over is mutated in place, so it is copied.
+  let pendingHeaders: Record<string, string> | undefined;
+
+  pi.on("before_provider_headers", (event, ctx) => {
+    if (ctx.model?.provider !== "alibaba-cloud") { pendingHeaders = undefined; return; }
+    const copy: Record<string, string> = {};
+    for (const [k, v] of Object.entries(event.headers ?? {})) {
+      if (typeof v === "string") copy[k] = v;
+    }
+    pendingHeaders = copy;
+  });
+
+  pi.on("before_provider_request", (event, ctx) => {
+    const model = ctx.model;
+    if (model?.provider !== "alibaba-cloud") return;
+    const headers = pendingHeaders;
+    pendingHeaders = undefined;
+    // Chat Completions has no session-cache header: models whose catalog rows
+    // include explicit-cache prices get markers instead, which turns their
+    // probabilistic implicit hits into deterministic explicit ones.
+    let outgoing = event.payload;
+    if (
+      model.api === "openai-completions" &&
+      loadConfig().cloudCacheControl !== false &&
+      cloudPricesFor(model.id)?.explicitCache
+    ) {
+      const marked = injectCacheControl(event.payload);
+      if (marked) outgoing = marked.payload;
+    }
+    // Captured verbatim so a warm replays a byte-identical prefix. Compaction
+    // and branch summaries never arrive here: pi builds their options without
+    // `onPayload`/`transformHeaders`, which is also why pi's own warmer skips
+    // them.
+    if (headers) {
+      warmer.noteRequest({
+        provider: model.provider,
+        model: model.id,
+        api: model.api,
+        baseUrl: model.baseUrl,
+        headers,
+        payload: outgoing,
+        at: Date.now(),
+      });
+      warmer.noteInFlight(true);
+    }
+    return outgoing === event.payload ? undefined : outgoing;
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    const m = event.message;
+    if (m.role !== "assistant" || m.provider !== "alibaba-cloud") return;
+    warmer.noteInFlight(false);
+    const key = `${m.provider}/${m.model}`;
+    const raw = cacheFieldsByModel.get(key);
+    cacheFieldsByModel.delete(key);
+    // A handler that throws would surface on the turn it was only measuring,
+    // so every field is read defensively.
+    const usage = m.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 };
+    const promptTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+    warmer.notePromptTokens(promptTokens);
+    if (!warmSettings().telemetry) return;
+    appendCacheLog(CACHE_LOG_PATH, {
+      ts: m.timestamp || Date.now(),
+      kind: "turn",
+      provider: m.provider,
+      model: m.model,
+      api: ctx.model?.api ?? "",
+      promptTokens,
+      cached: raw?.cached ?? usage.cacheRead ?? 0,
+      creation: raw?.creation ?? usage.cacheWrite ?? 0,
+      cacheType: raw?.cacheType,
+      ok: m.stopReason !== "error",
+    });
+  });
+
+  // A warm must never overlap a real request, and an aborted turn fires no
+  // `message_end`, so the run boundary clears the flag too.
+  pi.on("agent_end", () => warmer.noteInFlight(false));
+  // Anything that rewrites the transcript invalidates the cached prefix, so the
+  // captured request is no longer worth replaying.
+  pi.on("session_before_compact", () => warmer.invalidate("compaction rewrites the prefix"));
+  pi.on("session_before_tree", () => warmer.invalidate("branch switch rewrites the prefix"));
+  pi.on("session_before_switch", () => warmer.invalidate("session switch"));
+  pi.on("model_select", () => warmer.invalidate("model switch changes the cached prefix"));
+  pi.on("session_start", () => warmer.invalidate("session start"));
+  pi.on("session_shutdown", () => warmer.stop());
+
+  // Mode `pi`: pi's warmer decides by expected *savings*, which for a corporate
+  // key is the wrong question — a cold 200k-token prompt costs a minute, not a
+  // cent. The hook swaps in the latency rule; pi's 30/60-minute caps still
+  // apply, which is what mode `extension` exists for.
+  pi.on("cache_warming_decision", (event) =>
+    warmingDecisionOverride(warmSettings(), warmer.status().promptTokens, event));
 
   // DashScope reports some transient failures as SSE `server_error` events
   // over HTTP 200: rate limits with `<429>` in the message, and inference-
@@ -2179,6 +2662,7 @@ export default async function (pi: ExtensionAPI) {
         "Cloud — Auto workspace domain",
         "Cloud — Change API Format",
         "Cloud — Session Cache: On / Off",
+        "Cloud — Cache Warming",
         "Tools — Exposure",
         "Tools — Sidecar model",
         "Image — Default model",
@@ -2212,6 +2696,9 @@ export default async function (pi: ExtensionAPI) {
           `       Auto-WS:   ${cfg.cloudAutoWorkspaceDomain === false ? "off" : "on"}${cfg.cloudWorkspaceId ? ` (WorkspaceId ${cfg.cloudWorkspaceId})` : ""}`,
           `       Format:    ${cloudFmt}${fallbacks ? ` (${fallbacks} model${fallbacks === 1 ? "" : "s"} fall back to Chat Completions)` : ""}`,
           `       Sess.cache: ${cfg.cloudSessionCache === false ? "off" : "on (Responses header)"}`,
+          `       Markers:   ${cfg.cloudCacheControl === false ? "off" : "on (cache_control on Completions)"}`,
+          ...cacheStatusLines(cfg, warmer, CACHE_LOG_PATH),
+          ...(modelCacheLine(ctx.model, cfg) ? [modelCacheLine(ctx.model, cfg)!] : []),
           `       Sidecar:   ${resolveToolsExposure(cfg) === "off" ? "off" : `${resolveToolsExposure(cfg)} (${cfg.cloudSidecarModel || "auto Qwen"})`}`,
           `       Auth-only: ${cfg.cloudAuthorizedOnly === false ? "off" : "on (when endpoint available)"}${cfg.cloudAuthorizedFilteredLast ? " — active (filtered list)" : ""}`,
           `       Models:    ${cloudDefs.length} chat (${cloudState})`,
@@ -2422,6 +2909,11 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
 
+      if (choice === "Cloud — Cache Warming") {
+        await cacheWarmMenu(ctx, warmer, CACHE_LOG_PATH);
+        return;
+      }
+
       if (choice === "Tools — Exposure") {
         const tool = await ctx.ui.select("Which tool?", [
           `alibaba_tools (sidecar, billed) — now ${resolveToolsExposure(cfg)}`,
@@ -2571,10 +3063,11 @@ export default async function (pi: ExtensionAPI) {
       if (choice === "Reset all") {
         if (!await ctx.ui.confirm(
           "Reset all Alibaba settings?",
-          "Wipes config, both auth entries, legacy catalog caches, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
+          "Wipes config, both auth entries, legacy catalog caches, the cache telemetry log, and any alibaba-* entries in settings.json (enabledModels + defaultProvider/defaultModel if alibaba). Run before `pi remove` for a clean uninstall.",
         )) return;
         try { fs.unlinkSync(CONFIG_PATH); } catch {}
         try { fs.unlinkSync(CATALOG_CACHE_PATH); } catch {}
+        try { fs.unlinkSync(CACHE_LOG_PATH); } catch {}
         removeLegacyCaches();
         // Use authStorage.remove() so pi's in-memory credential cache stays in sync —
         // otherwise /login's "• configured" label persists until pi is restarted.

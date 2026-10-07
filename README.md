@@ -12,6 +12,8 @@ The complete [`pi`](https://github.com/badlogic/pi-mono) extension for Alibaba's
 - **Image generation** (Cloud): DashScope's `qwen-image-*`, `z-image-*`, and `wan*-image`/`wan*-t2i` families are registered as pi **image models**, reachable from `codemode` scripts through `models.generateImages()` **and** through a dedicated `alibaba_image` tool that carries every generation parameter. Also available without `codemode` via `/alibaba image <prompt>`. Plan accounts register no image models.
 - **Configurable tool exposure**: each Alibaba tool can be `codemode` (default), `direct`, `deferred`, or off. The default keeps tool declarations out of every request while surviving a reload and staying callable from scripts.
 - **Vision Capable**: Image input automatically enabled for VL models, Qwen 3.8, Qwen 3.x Plus variants, and Kimi.
+- **Prompt-cache warming that treats latency as the point**: the extension replays your last request with a 16-token cap to keep DashScope's 5-minute cache block alive — on its own schedule, for hours, with retries — so a long pause does not turn the next turn into a 1–2 minute cold prefill. Tunable in `/alibaba → Cloud — Cache Warming`, with per-turn cache telemetry (`cached_tokens` **and** the `cache_creation_input_tokens` pi never sees).
+- **Honest catalog pricing**: input/output/cache-read/cache-write are parsed from the exact price rows (tiered models priced at the tier you actually send, peak vs off-peak resolved, thinking-mode rows understood) and declared in CNY or converted USD.
 - **Live Catalog**: Cloud prefers Alibaba's native `GET /api/v1/models` (real context windows, max output, capability tags, pricing) and falls back to compatible-mode `/models`. Plan still uses the live `/compatible-mode/v1/models` list. New models appear as Alibaba ships them — no extension update needed.
 
 ## How to Use (Quickstart)
@@ -59,6 +61,7 @@ If you've already run `pi remove` and want to clean leftovers manually:
 
 ```bash
 rm -f ~/.pi/agent/alibaba-config.json ~/.pi/agent/alibaba-models.cache.json ~/.pi/agent/alibaba-catalog.lock* \
+      ~/.pi/agent/alibaba-cache.jsonl \
       ~/.pi/agent/alibaba-plan-models.cache.json ~/.pi/agent/alibaba-cloud-models.cache*.json  # 1.4.x leftovers
 # then edit ~/.pi/agent/auth.json and remove the "alibaba-plan" / "alibaba-cloud" entries
 # then edit ~/.pi/agent/settings.json and drop any "alibaba-*/..." or "dashscope/..." entries from enabledModels
@@ -144,6 +147,83 @@ The previous key's endpoint is never inherited — keeping it is exactly what tu
 
 `GET /api/v1/models/permissions` returns the models your business space is authorized to call. When the endpoint is reachable (Beijing workspace domain), the extension intersects it with the live catalog and hides models you don't have inference permission for. On by default; disable via `/alibaba → Cloud — Authorized-only Filter`. If the fetch fails or the intersection would be empty, the full catalog is shown.
 
+## Prompt cache & warming
+
+DashScope caches the **prefix** of a request for 5 minutes, and every hit renews that window
+(measured, not documented behaviour — see `docs/notes/`). A hit is worth latency first and money
+second: a 150k–220k-token prompt answers in **10–17 s from cache and 57–151 s cold**. Warming is how
+a pause longer than five minutes stops costing a minute of wall time.
+
+**This extension runs its own warmer for Cloud models** (`extensions/cache-warm.ts`). It captures each
+request as pi dispatches it — payload and resolved headers — and replays it byte-identically with a
+16-token output cap, which renews the block without producing an answer. pi's own warmer is a
+money mechanism: it refreshes only when the expected savings clear $0.05, gives up permanently when a
+timer fires a few seconds late, and stops 30 min after the last request. Those rules cost 10 of 146
+warms in our own history — each one arriving after expiry and paying a full-price rewrite. Because
+`promptCache` is the only model field pi's warmer reads, Cloud cards declare it only in `pi` mode, so
+the two engines never refresh the same block.
+
+`/alibaba → Cloud — Cache Warming`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Engine | `extension` | `extension` = this warmer (own horizon, retries, no dollar gate); `pi` = pi's warmer, with our `cache_warming_decision` handler replacing its savings gate by the same latency rule; `off` = no warming |
+| Refresh interval | 216 s | Seconds between refreshes. The block lives 300 s, so the gap is your margin: 150 s → 150 s of slack, 270 s → 30 s |
+| Horizon | 240 min | How long to keep warming after the last real request |
+| Minimum prompt | 20 000 tokens | Smaller prompts are fast even when cold; warming them only spends quota |
+| Telemetry | on | One JSON line per turn and per warm in `alibaba-cache.jsonl` |
+
+The same page has **Warm now** (send a refresh immediately and print what the provider reported) and
+**Cache statistics** (hit rate, cached vs cold tokens, and how many warms arrived after expiry —
+rewrites mean the interval is too long for your prompt size). `/alibaba → Status` shows the engine
+state, the next refresh, and the current model's cache economics.
+
+Failures back off (×2, ×3, ×4 on the interval) and end the run after four, because a warm that cannot
+get through is usually a rate limit and the next real request needs that quota. A warm never overlaps
+a real request, and compaction or a branch switch drops the captured request instead of warming a
+prefix that no longer exists.
+
+### What a cached turn costs
+
+Prices come from the live catalog (`GET /api/v1/models`), matched by exact row type, in the tier that
+contains `priceTierTokens` (default 128k) and the `standard` time band. The catalog bills **CNY per
+million tokens**; `costCurrency` says whether pi's `cost.*` should carry those numbers (default — the
+figure the Bailian console bills) or convert to USD at `cnyPerUsd` (default 7.1). Status always states
+the unit.
+
+For `qwen3.8-max-0902` (12 CNY/M input): a session-cache **read costs 1** (8.3 %), a **write 15**
+(125 %), an implicit-cache read 1.5 (12.5 %). Explicit caching is what the wire actually uses —
+the `x-dashscope-session-cache` header on Responses, `cache_control` markers on the Anthropic and
+Completions shapes — and the declared read/write pair follows that. Families without explicit-cache
+rows (`glm-5.3`, `kimi-k3`, `deepseek-v4.x`) stay on implicit caching, where the header and the
+markers are no-ops and reads cost 10–25 %.
+
+`responsesInputGuard` (default on) declares 80 % of the catalog context window on Responses models:
+the endpoint silently truncates input above that, and a truncated tail also invalidates the cached
+prefix for every later turn.
+
+### Keeping the prefix stable
+
+The cache is **prefix-scoped**: it stores bytes, not sessions, and one changed byte near the front
+invalidates everything after it. In our own telemetry that was the single largest loss — 38 % of
+cold-miss spend happened *under 300 s after the previous request*, i.e. not from expiry but from
+rewrites no warmer can undo. Three rules, in order of impact:
+
+1. **Tool definitions ride in the system message.** Adding, removing or reordering tools — or editing
+   a description — costs a full-price rewrite of the whole prompt on the next turn. This is why both
+   Alibaba tools default to `codemode` exposure: they stay callable without being declared every turn.
+2. **Time rewrites to a dead cache.** Compaction, context edits, persona/role switches and skill-list
+   changes all invalidate the prefix, so their marginal cost is zero right after a pause of 5+ minutes
+   and maximal in the middle of a run. Compact on resume, not mid-turn.
+3. **Nothing volatile in the system prompt.** A timestamp, a counter or a changing working-directory
+   listing in any prompt section costs a full miss on every turn. This extension's own
+   `before_agent_start` section is static for exactly that reason.
+
+A related consequence: because the cache is prefix-scoped rather than session-scoped, two sessions
+that share a byte-identical prefix share the block. Subagents could inherit their parent's cache the
+same way — that needs pi-subagents to keep the forked prefix identical, and is tracked in
+`docs/TODO.md` (P2-I).
+
 ## Studio plan models — dynamic source
 
 The plan model list is fetched from the canonical Qwen Code template:
@@ -164,7 +244,7 @@ The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, tex
 - **Image generation**: Cloud only; a Plan account registers no image models. DashScope bills **per image**, not per token, so the picker's cost figures do not cover image generation and image cards declare zero cost. pi's own `models.generateImages()` carries only a prompt and reference images — no `size`, `n`, `seed`, or prompt-extension switches — which is why `alibaba_image` and `/alibaba image` exist. A generation takes 6–57 s depending on the model. The returned URLs expire in 24 hours, so the extension downloads the bytes and returns image content; nothing is written to disk unless `save` (tool) or `--save` (command) is given.
 - **Output budget vs. thinking budget**: On the Anthropic path, `max_tokens` is a **total** budget shared between thinking and the final answer. pi splits the card's `maxTokens` accordingly, so a card value of 8192 leaves only 8192 − 7168 = **1024 tokens** for the actual answer at high thinking — enough to truncate large tool calls (e.g. big `write`/`edit` content) mid-arguments. The card therefore reports the model's own catalog `max_output_tokens` whenever the catalog has a row (clamped at 131072 — e.g. `qwen-plus` = 32768, which yields a 16384-token answer budget at high thinking). Models with **no** catalog row keep a conservative fallback (32768; 8192 for non-reasoning ids and the open-weight `qwen3-<size>b` line, measured at 8192), because overshooting the real ceiling is rejected outright with `Range of max_tokens should be [1, N]`. Completions and Responses keep the catalog's larger output ceilings.
 - **Dynamic Caching**: Model lists use the plan-C hybrid (private snapshot + pi's models store as a bonus channel; details above). If a new model drops and you don't see it, run `/alibaba` -> `Refresh model lists` (force — always fetches).
-- **Prompt caching & cache warming**: caching-capable families declare `promptCache: {short: 300}` (DashScope's documented 5-minute ephemeral window, renewed on a hit), which makes them eligible for pi 0.86+'s prompt-cache warming — the global `cacheWarming` setting (`off` / `streaming` / `idle`) decides when warming happens. No `long` tier is declared (none is published). The open-weight `qwen3-<size>b` line has no documented caching and is never warmed. On the Cloud **Responses** format each request additionally carries `x-dashscope-session-cache: enable` — DashScope's server-side session cache gives predictable multi-turn prefix hits (reads billed at ~10% instead of the implicit cache's 20–25%; cache writes at 125%; 5-min window renewed on hit). It is documented for the Responses endpoint only, so Completions/Anthropic requests stay unmarked. Because writes cost 125% of input, one-shot-heavy usage can switch the header off with `/alibaba → Cloud — Session Cache: On / Off` (`cloudSessionCache` in config); multi-turn agent sessions should keep it on.
+- **Prompt caching & cache warming**: Cloud models are warmed by **this extension's own engine**, not by pi's — see [Prompt cache & warming](#prompt-cache--warming) for the settings and the reasons. pi's global `cacheWarming` setting therefore has no effect on Cloud models unless you switch the engine to `pi` (`/alibaba → Cloud — Cache Warming → Engine…`), which declares `promptCache` again and hands the schedule back to the host. The Plan provider still uses pi's warmer with the documented 5-minute window. No `long` tier is declared anywhere (DashScope publishes none), and the open-weight `qwen3-<size>b` line has no documented caching, so it is never warmed.
 - **Inferred Context Windows**: Compatible-mode `/v1/models` returns only ids and names, so context windows are inferred from the model id unless native `/api/v1/models` supplied a real value. If a brand-new model shows the wrong size, fix it yourself with `/alibaba → Context Window — Override` (per model, or `*` for all) — no extension update needed.
 
 ## `/alibaba` command reference
@@ -179,6 +259,7 @@ The Cloud provider prefers Alibaba's native `GET /api/v1/models` (paginated, tex
 | Cloud — Change Domain        | International / China / US / HK / workspace domains / Custom             |
 | Cloud — Change API Format    | OpenAI Responses (default) / Anthropic Messages / OpenAI Chat Completions |
 | Cloud — Session Cache: On / Off | toggles `x-dashscope-session-cache` on Cloud Responses requests |
+| Cloud — Cache Warming        | Engine (extension / pi / off), refresh interval, horizon, minimum prompt size, telemetry, Warm now, Cache statistics |
 | Tools — Exposure | Set `alibaba_tools` / `alibaba_image` to codemode (default), direct, deferred, or off |
 | Tools — Sidecar model | Pin the Qwen model `alibaba_tools` uses (blank = auto) |
 | Image — Default model | Pick the default DashScope image model for the tool and `/alibaba image` |
@@ -257,9 +338,9 @@ All paths live in pi's config directory — `~/.pi/agent` by default, or `$PI_CO
 | Path                                                  | Purpose                            |
 |-------------------------------------------------------|------------------------------------|
 | `~/.pi/agent/auth.json`                               | Both provider credentials (0600)   |
-| `~/.pi/agent/alibaba-config.json`                     | Endpoint / domain / format config  |
-| `~/.pi/agent/alibaba-config.json`                             | endpoints, domain/format, toggles, catalog fetch timestamps |
-| `~/.pi/agent/alibaba-models.cache.json`                     | versioned catalog snapshot (boot seed, written after fetches) |
+| `~/.pi/agent/alibaba-config.json`                     | endpoints, domain/format, toggles, cache-warming and price settings, catalog fetch timestamps |
+| `~/.pi/agent/alibaba-models.cache.json`               | versioned catalog snapshot (boot seed, written after fetches; includes the raw price rows) |
+| `~/.pi/agent/alibaba-cache.jsonl`                     | prompt-cache telemetry: one line per turn and per warm, with the provider's own `cached_tokens` / `cache_creation_input_tokens` (capped at ~1.5 MB) |
 
 Model catalogs live in **two places on purpose** (the "plan C" hybrid): pi's provider models store (`models-store.json`) is a bonus channel, while a private versioned snapshot `alibaba-models.cache.json` — written only after a real fetch — seeds provider registration at boot with **zero network** and keeps the extension independent of pi's store semantics. `alibaba-catalog.lock` is a transient fetch lock. Every JSON write is atomic (tmp + rename), so parallel instances can never observe a torn file. Uninstalling removes only our files — `models-store.json` belongs to pi and is shared with other providers, so delete our rows there only if you also want the cached catalogs gone.
 
