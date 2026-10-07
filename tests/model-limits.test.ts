@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildEquivalenceIndex,
   deriveRequestCap,
   deriveResponsesCap,
   MEASURED_INPUT_CAPS,
@@ -139,6 +140,45 @@ describe("resolveOutputCap", () => {
     assert.equal(resolveOutputCap(DEEPSEEK_V32, 0), 65_536);
     assert.equal(resolveOutputCap(DEEPSEEK_V32, undefined), 65_536);
     assert.equal(resolveOutputCap(undefined, 0), undefined);
+  });
+});
+
+describe("equivalence links (the catalog's own equivalent_snapshot)", () => {
+  it("resolves a measurement through the declared twin", () => {
+    // qwen3.7-plus was probed; qwen3.7-plus-2026-05-26 is the same deployment,
+    // so the dated snapshot should not fall back to a derived cap.
+    assert.deepEqual(
+      resolveContextWindow("qwen3.7-plus-2026-05-26", "openai-responses", QWEN38_MAX, 1_000_000,
+        { equivalent: "qwen3.7-plus" }),
+      { window: 792_907, source: "measured" },
+    );
+    assert.equal(
+      resolveContextWindow("qwen3.7-plus-2026-05-26", "openai-completions", QWEN38_MAX, 1_000_000,
+        { equivalent: "qwen3.7-plus" }).window,
+      983_616,
+    );
+    // A model's own measurement wins over its twin's.
+    assert.equal(
+      resolveContextWindow("qwen3.8-flash", "openai-responses", QWEN38_MAX, 1_000_000,
+        { equivalent: "qwen3.7-plus" }).window,
+      800_056,
+    );
+  });
+
+  it("indexes both directions and ignores empty links", () => {
+    const idx = buildEquivalenceIndex([
+      ["qwen3.7-plus", "qwen3.7-plus-2026-05-26"],
+      ["qwen3-max", "qwen3-max-2026-01-23"],
+      ["qwen3.8-27b", undefined],
+      ["qwen3.8-2.4t-a95b", ""],
+      ["self", "self"],
+    ]);
+    assert.equal(idx.get("qwen3.7-plus"), "qwen3.7-plus-2026-05-26");
+    assert.equal(idx.get("qwen3.7-plus-2026-05-26"), "qwen3.7-plus");
+    assert.equal(idx.get("qwen3-max-2026-01-23"), "qwen3-max");
+    assert.equal(idx.has("qwen3.8-27b"), false);
+    assert.equal(idx.has("qwen3.8-2.4t-a95b"), false);
+    assert.equal(idx.has("self"), false);
   });
 });
 

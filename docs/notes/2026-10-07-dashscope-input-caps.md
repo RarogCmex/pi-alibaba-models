@@ -118,6 +118,13 @@ ceiling is declared.
   0.755 — both measured.
 - `resolveContextWindow()` returns the number **and its source** (`measured` / `derived` / `override` /
   `catalog`), which `/alibaba → Status` prints, so an unmeasured model is visibly a guess.
+- Measurements propagate through the catalog's own `equivalent_snapshot` links (both directions), so
+  a dated snapshot inherits its alias's measurement instead of falling back to a derived cap:
+  `qwen3.7-plus-2026-05-26` declares 792 907 like `qwen3.7-plus`, not 767 220.
+- For the qwen3.7/3.8 generations the derived request cap happens to be **exact** — `min(ctx,
+  max_input, reasoning_max_input)` = 983 616, the measured value — and the derived Responses cap is
+  767 220 against measured 792 907–800 056, i.e. 3–4 % conservative: compaction comes slightly
+  early, truncation never does.
 - `resolveOutputCap()` folds `reasoning_max_output_tokens` into the declared `maxTokens`.
 - A `Context Window — Override` still wins outright, and `responsesInputGuard: false` re-declares the
   full window for users who would rather see the catalog number.

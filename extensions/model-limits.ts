@@ -113,6 +113,21 @@ export interface ResolvedWindow {
 }
 
 /**
+ * Both directions of the catalog's own `equivalent_snapshot` links, so an alias
+ * and the dated snapshot it points at resolve to the same measurement. The
+ * catalog asserts the equivalence, so inheriting a cap across it is not a guess.
+ */
+export function buildEquivalenceIndex(pairs: Iterable<[string, string | undefined]>): Map<string, string> {
+  const index = new Map<string, string>();
+  for (const [id, equivalent] of pairs) {
+    if (!id || !equivalent || id === equivalent) continue;
+    if (!index.has(id)) index.set(id, equivalent);
+    if (!index.has(equivalent)) index.set(equivalent, id);
+  }
+  return index;
+}
+
+/**
  * The context window to declare for one model on one shape: the largest window
  * pi can fill without the endpoint rejecting the request (Completions,
  * Anthropic) or silently dropping its middle (Responses). An explicit user
@@ -128,10 +143,11 @@ export function resolveContextWindow(
   api: string,
   limits: CatalogLimits | undefined,
   baseWindow: number,
-  opts: { override?: number; responsesGuard?: boolean } = {},
+  opts: { override?: number; responsesGuard?: boolean; equivalent?: string } = {},
 ): ResolvedWindow {
   if (positive(opts.override)) return { window: Math.floor(opts.override), source: "override" };
-  const measured = MEASURED_INPUT_CAPS[id];
+  const measured = MEASURED_INPUT_CAPS[id]
+    ?? (opts.equivalent ? MEASURED_INPUT_CAPS[opts.equivalent] : undefined);
   const requestCap = measured?.request ?? deriveRequestCap(limits, baseWindow);
   const wantsResponsesCap = api === "openai-responses" && opts.responsesGuard !== false;
   // The documented rule is a fraction of the *context window*, and a request cap

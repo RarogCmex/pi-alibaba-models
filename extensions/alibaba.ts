@@ -51,6 +51,7 @@ import {
 } from "./cache-warm.ts";
 import { injectCacheControl } from "./cache-control.ts";
 import {
+  buildEquivalenceIndex,
   resolveContextWindow,
   resolveOutputCap,
   type CatalogLimits,
@@ -817,6 +818,7 @@ interface ApiV1Model {
     reasoning_max_input_tokens?: number | null;
     reasoning_max_output_tokens?: number | null;
   };
+  equivalent_snapshot?: string | null;
   prices?: CatalogPriceRange[];
 }
 
@@ -828,8 +830,19 @@ interface ApiV1Model {
 export interface CatalogEntry {
   prices?: CatalogPrices;
   limits?: CatalogLimits;
+  /** The catalog's own `equivalent_snapshot`: the dated twin of an alias. */
+  equivalent?: string;
 }
 const cloudCatalog = new Map<string, CatalogEntry>();
+// Alias ↔ dated snapshot, both directions, so a measurement of one covers the
+// other. Rebuilt whenever the catalog map is filled.
+let cloudEquivalent = new Map<string, string>();
+
+function rebuildEquivalenceIndex() {
+  cloudEquivalent = buildEquivalenceIndex(
+    [...cloudCatalog.entries()].map(([id, entry]) => [id, entry.equivalent] as [string, string | undefined]),
+  );
+}
 
 /** Price rows of one catalog model, or undefined when the catalog had none. */
 export const cloudPricesFor = (id: string): CatalogPrices | undefined => cloudCatalog.get(id)?.prices;
@@ -843,6 +856,7 @@ const positiveOrNull = (v: number | null | undefined): number | undefined =>
 function catalogEntryOf(m: ApiV1Model): CatalogEntry {
   const info = m.model_info ?? {};
   return {
+    equivalent: typeof m.equivalent_snapshot === "string" && m.equivalent_snapshot ? m.equivalent_snapshot : undefined,
     limits: {
       contextWindow: positiveOrNull(info.context_window),
       maxInput: positiveOrNull(info.max_input_tokens),
@@ -916,6 +930,7 @@ async function fetchCloudModelsV1(domain: string, apiKey: string): Promise<ChatM
       }
       if (models.length >= (output.total ?? 0) || output.models.length < 100) break;
     }
+    rebuildEquivalenceIndex();
     return models.length ? models : null;
   } catch {
     return null;
@@ -1132,6 +1147,8 @@ export interface CloudModelBuildOptions {
   cnyPerUsd?: number;
   /** Raw catalog rows (prices + size limits); defaults to the last fetch. */
   catalog?: ReadonlyMap<string, CatalogEntry>;
+  /** Alias ↔ snapshot links matching `catalog`; defaults to the fetched index. */
+  equivalents?: ReadonlyMap<string, string>;
   /**
    * Declare the shape's effective input cap instead of the catalog window.
    * Default true; turning it off re-declares the full window and accepts the
@@ -1213,6 +1230,7 @@ export function buildCloudModels(
     const win = resolveContextWindow(m.id, api, entry?.limits, card.contextWindow, {
       override: opts.overrides?.[m.id] ?? opts.overrides?.["*"],
       responsesGuard: guard,
+      equivalent: opts.catalog === undefined ? cloudEquivalent.get(m.id) : opts.equivalents?.get(m.id),
     });
     // `reasoning_max_output_tokens` is a hard ceiling while thinking is on
     // (qwen3-max rejects the 65 536 its own catalog row advertises with `Range
@@ -1769,6 +1787,7 @@ function seedFromSnapshot() {
     for (const [id, entry] of Object.entries(cache.cloud.catalog ?? {})) {
       if (entry && typeof entry === "object" && !cloudCatalog.has(id)) cloudCatalog.set(id, entry);
     }
+    rebuildEquivalenceIndex();
   }
   // Presence of the `cloudImages` section counts as "already fetched", even when
   // the curated filter emptied it — otherwise an account with no image models
