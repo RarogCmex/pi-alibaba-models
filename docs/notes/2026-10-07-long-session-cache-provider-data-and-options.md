@@ -529,7 +529,7 @@ Decisions and live verification: [`docs/specs/2.1.0-cache-warming-and-prices.md`
 | P2-I child prefix alignment | deferred upstream | `docs/TODO.md` (experiment now cheap: telemetry reports creation vs cached) |
 | P2-J model guidance | **implemented** | `/alibaba → Status` `Model:` line (`formatCacheEconomics`) + README |
 | P2-K adaptive header | **decided against "Auto"** | `docs/TODO.md`; stays `on`/`off` |
-| P2-L Responses 80 % guard | **implemented** (default on) | `alibaba.ts` `RESPONSES_INPUT_FRACTION`, config `responsesInputGuard` |
+| P2-L Responses 80 % guard | **implemented**, and then corrected by measurement: the cap is per model, not a flat 80 % | `extensions/model-limits.ts` (`MEASURED_INPUT_CAPS`, `resolveContextWindow`), config `responsesInputGuard` — see `docs/notes/2026-10-07-dashscope-input-caps.md` |
 | P3-M extension-owned warmer | **implemented**, and it is now the default engine | `extensions/cache-warm.ts` (`createCacheWarmer`, `planWarm`) |
 | P3-N `cache_control` on Completions | **implemented** (default on, gated on catalog rows) | `extensions/cache-control.ts` |
 | P3-O server-side context / PTU | deferred (upstream / purchasing) | `docs/TODO.md` |
