@@ -1,5 +1,14 @@
 # DashScope context cache: TTL facts & cache warming (2026-10-07)
 
+> **Partly superseded the same day** by
+> [`2026-10-07-long-session-cache-provider-data-and-options.md`](2026-10-07-long-session-cache-provider-data-and-options.md),
+> which measures what this note could only read from documentation: live catalog prices (the
+> qwen3.8 "console-TBD" exception is 8.33 % explicit / 12.5 % implicit, not 10 % / 20 %), the
+> provider's usage-field map, TTL renewal and cache scope, pi's warmer constants (30-min idle cap,
+> 270 s schedule, $0.05 gate on our declared prices), and 146 real warm requests. The economics
+> table and the session-cache rule of thumb below are superseded; see its §5 for a line-by-line
+> correction list.
+
 Research notes after a night of orchestrator sessions with heavy `cache miss` telemetry
 (pi-debi turn-metrics: every miss after idle ≥ ~5 min; active back-to-back turns hit).
 
