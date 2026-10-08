@@ -92,9 +92,13 @@ export function parseRangeTokens(name: string | undefined): { lo: number; hi: nu
 
 /**
  * The range to price from: an explicit `Default` when the model has one, else
- * the tier containing `tierTokens`, else the widest tier. pi holds one price
- * per model while DashScope bills per request size, so this is an estimate by
- * construction — /alibaba → Status says which tier was chosen.
+ * the tier containing `tierTokens`, else the widest tier. DashScope bills per
+ * request size while this declares one flat `cost`, so the number is an
+ * estimate by construction — /alibaba → Status says which tier was chosen.
+ * The host can bill per request size itself: `cost.tiers` (`ModelCostTier`,
+ * `inputTokensAbove`, highest matching threshold prices the whole request) has
+ * been accepted on extension-registered models since pi 0.80.6 and is not used
+ * here yet. See docs/TODO.md → “Request-wide price tiers”.
  */
 export function pickPriceRange(
   ranges: CatalogPriceRange[] | undefined,

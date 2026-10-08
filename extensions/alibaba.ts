@@ -2511,7 +2511,7 @@ export default async function (pi: ExtensionAPI) {
   // registering a half-working provider.
   if (!hostVersionSupported(VERSION)) {
     throw new Error(
-      `pi-alibaba-models 2.1.0 requires pi 1.0.0 or newer (found ${VERSION}). ` +
+      `pi-alibaba-models 2.1.1 requires pi 1.0.0 or newer (found ${VERSION}). ` +
       `Stay on pi-alibaba-models 1.5.3 for older hosts.`,
     );
   }
@@ -2579,9 +2579,13 @@ export default async function (pi: ExtensionAPI) {
       if (marked) outgoing = marked.payload;
     }
     // Captured verbatim so a warm replays a byte-identical prefix. Compaction
-    // and branch summaries never arrive here: pi builds their options without
-    // `onPayload`/`transformHeaders`, which is also why pi's own warmer skips
-    // them.
+    // and branch summaries never arrive here: pi wires `onPayload`, which is
+    // what emits this event, only through the agent loop, and builds summary
+    // options without it (re-verified in pi 1.1.0). They *do* reach
+    // `before_provider_headers`, so `pendingHeaders` can briefly hold a
+    // summary's headers — harmless, because nothing is captured without a
+    // payload event and the next real request overwrites them first. pi's own
+    // warmer skips summaries the same way, by routing id.
     if (headers) {
       if (!modelCachesPrompt(model.id)) {
         // Warming a model with no cache rows would buy nothing and spend quota.
