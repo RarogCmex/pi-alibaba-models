@@ -7,12 +7,14 @@ import {
   ALIBABA_IMAGE_PARAMETERS,
   buildImageModels,
   buildImageRequest,
+  curatedImageInput,
   DEFAULT_IMAGE_MODEL,
   downloadImage,
   filterCuratedImageModels,
   generateDashScopeImages,
   imageCardName,
   imageMetadataFrom,
+  isEditOnlyImageModel,
   isImageEditModel,
   parseImageCatalog,
   parseImageCommand,
@@ -244,13 +246,34 @@ describe("tool parameter mapping", () => {
     assert.equal(pickImageModel({ catalogIds: ["qwen-image-3.0-pro", "qwen-image-plus"] }), "qwen-image-plus");
   });
 
-  it("names the editor models that need reference images", () => {
+  it("names the models that accept reference images", () => {
     assert.equal(isImageEditModel("qwen-image-edit-plus"), true);
     assert.equal(isImageEditModel("qwen-image-3.0"), true);
     assert.equal(isImageEditModel("qwen-image-plus"), false);
+    assert.deepEqual(curatedImageInput("qwen-image-3.0"), ["text", "image"]);
+  });
+
+  it("separates the edit-only models from the qwen-image-3.0 hybrids", () => {
+    // The hybrids sit on both curated lists: they edit references and generate
+    // from text (verified live on both protocols, 2026-10-09).
+    assert.equal(isEditOnlyImageModel("qwen-image-edit"), true);
+    assert.equal(isEditOnlyImageModel("qwen-image-edit-plus"), true);
+    assert.equal(isEditOnlyImageModel("qwen-image-edit-max"), true);
+    assert.equal(isEditOnlyImageModel("qwen-image-3.0"), false);
+    assert.equal(isEditOnlyImageModel("qwen-image-3.0-pro"), false);
+    assert.equal(isEditOnlyImageModel("qwen-image-plus"), false);
+  });
+
+  it("does not demand references from a model that can generate", () => {
+    assert.equal(validateEditorReferences("qwen-image-3.0", 0), undefined);
+    assert.equal(validateEditorReferences("qwen-image-3.0-pro", 0), undefined);
+    assert.equal(validateEditorReferences("qwen-image-3.0", 2), undefined);
+    assert.equal(validateEditorReferences("qwen-image-plus", 0), undefined);
     assert.equal(validateEditorReferences("qwen-image-edit-plus", 1), undefined);
     assert.match(validateEditorReferences("qwen-image-edit-plus", 0) ?? "", /image editor and needs 1–3 reference images/);
-    assert.equal(validateEditorReferences("qwen-image-plus", 0), undefined);
+    // the >3 cap belongs to validateImageReferences and applies to hybrids too
+    assert.equal(validateEditorReferences("qwen-image-3.0", 4), undefined);
+    assert.match(validateImageReferences(4) ?? "", /at most 3/);
   });
 
   it("validates metadata in one shared reader", () => {

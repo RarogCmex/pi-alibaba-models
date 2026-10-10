@@ -85,8 +85,24 @@ export function curatedImageInput(id: string): ("text" | "image")[] {
   return isImageEditModel(id) ? ["text", "image"] : ["text"];
 }
 
+/** True when the model *accepts* reference images — editors and hybrids alike. */
 export function isImageEditModel(id: string): boolean {
   return (IMAGE_EDIT_IDS as readonly string[]).includes(id);
+}
+
+/**
+ * True only when the model cannot generate from text alone, i.e. it is on the
+ * editor list and not on the generator list. `qwen-image-3.0` and
+ * `qwen-image-3.0-pro` are on both: they edit references *and* accept a
+ * text-only request — T2I on the hybrid pair was verified live on 2026-10-09
+ * against both protocols (the native multimodal-generation endpoint this
+ * extension uses, and the OpenAI-compatible one; `input_image_count: 0`, HTTP
+ * 200), and Model Studio's reference documents both operations as supported.
+ * Treating "can edit" as "must edit" rejected the default configured image
+ * model on every reference-free call, client-side, before any request went out.
+ */
+export function isEditOnlyImageModel(id: string): boolean {
+  return isImageEditModel(id) && !(TEXT_TO_IMAGE_IDS as readonly string[]).includes(id);
 }
 
 /** The recommended family is the one the system-prompt section points at. */
@@ -489,7 +505,8 @@ export const ALIBABA_IMAGE_PARAMETERS = {
       type: "string" as const,
       description:
         "DashScope image model id (default: the configured image model, else qwen-image-plus). " +
-        "Editors (qwen-image-edit-*, qwen-image-3.0*) need 1–3 reference images; generators do not.",
+        "Only qwen-image-edit-* requires 1–3 reference images; every other model generates from " +
+        "text and may take references (qwen-image-3.0* does both).",
     },
     task: {
       type: "string" as const,
@@ -625,9 +642,13 @@ export function validateImageReferences(count: number): string | undefined {
   return undefined;
 }
 
-/** Editors reject a call without 1–3 reference images; surface that early. Pure. */
+/**
+ * Edit-only models reject a call without 1–3 reference images; surface that
+ * early. A hybrid (`qwen-image-3.0*`) with no references is a legal T2I call
+ * and passes through. Pure.
+ */
 export function validateEditorReferences(modelId: string, count: number): string | undefined {
-  if (isImageEditModel(modelId) && count < 1) {
+  if (isEditOnlyImageModel(modelId) && count < 1) {
     return `"${modelId}" is an image editor and needs 1–3 reference images (pass images).`;
   }
   return undefined;

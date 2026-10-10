@@ -152,6 +152,7 @@ if (process.env.MODE === "info") {
     ...(process.env.MODE === "exec-save" ? { save: savePath } : {}),
     ...(process.env.MODE === "exec-refuse" ? { images: ["a.png", "b.png", "c.png", "d.png"] } : {}),
     ...(process.env.MODE === "exec-editor" ? { model: "qwen-image-edit-plus" } : {}),
+    ...(process.env.MODE === "exec-hybrid" ? { model: "qwen-image-3.0" } : {}),
   };
   let output;
   try {
@@ -344,6 +345,15 @@ describe("alibaba_image tool behaviour", () => {
     assert.equal(out.isError, true);
     assert.match(out.structuredContent.error, /image editor and needs 1–3 reference images/);
     assert.deepEqual(out.structuredContent.images, []);
+  });
+
+  it("lets a qwen-image-3.0 hybrid generate with no reference images", async () => {
+    const dir = makeFixture({});
+    const out = JSON.parse(await runChild(dir, "exec-hybrid"));
+    assert.equal(out.isError, false);
+    assert.equal(out.refCount, 0); // text-only request body reached the registry
+    assert.equal(out.structuredContent.model, "qwen-image-3.0");
+    assert.deepEqual(out.contentTypes, ["text", "image"]);
   });
 });
 

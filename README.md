@@ -327,7 +327,7 @@ Both tools share one namespace (`alibaba`) with longer `instructions` a script r
 
 ## Image generation
 
-Cloud keys register Alibaba's prompt-driven image models (`qwen-image-3.0-pro`, `qwen-image-3.0`, `qwen-image-max`, `qwen-image-plus`, `qwen-image`, `qwen-image-2.0`, `z-image-turbo`, `wan2.7-image-pro`, `wan2.6-t2i`, plus the `qwen-image-edit-*` editors) as pi **image models**. Vertical products (virtual try-on, face chains, word art) and third-party ids are never registered. Image models use the same Cloud key and Domain as chat.
+Cloud keys register Alibaba's prompt-driven image models (`qwen-image-3.0-pro`, `qwen-image-3.0`, `qwen-image-max`, `qwen-image-plus`, `qwen-image`, `qwen-image-2.0`, `z-image-turbo`, `wan2.7-image-pro`, `wan2.6-t2i`, plus the `qwen-image-edit-*` editors) as pi **image models**. Vertical products (virtual try-on, face chains, word art) and third-party ids are never registered. Image models use the same Cloud key and Domain as chat. `qwen-image-3.0-pro` and `qwen-image-3.0` are hybrids — they generate from text *and* edit 1–3 references — and only the `qwen-image-edit-*` models require references.
 
 Three ways to use them:
 
