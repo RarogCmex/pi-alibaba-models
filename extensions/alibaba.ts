@@ -77,7 +77,9 @@ import {
 // only through the chat member, so the catalog types work against it; `type`
 // stays unset, which pi reads as "chat". Image entries use the union's image
 // member (`ImageModelConfig` in image.ts). The host floor is pi 1.0.0 (ADR-0001),
-// so `Extract` is safe — the pre-1.0.0 exclusion this replaced is gone.
+// so `Extract` is safe — the pre-1.0.0 exclusion this replaced is gone. Why an
+// alias at all (the host exports the union, never its members) is measured in
+// docs/notes/2026-10-11-host-model-config-export-surface.md.
 type ChatModelConfig = Extract<PiModelConfig, { type?: "chat" }>;
 
 // ── Paths ─────────────────────────────────────────────────────────────

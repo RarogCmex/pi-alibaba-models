@@ -48,6 +48,19 @@ then, `/model` plus the per-model thinking levels already cover the manual versi
 - **Generation parameters through pi's own `models.generateImages()`.** The host's codemode API
   accepts a model and a context only. The dedicated `alibaba_image` tool exists precisely because of
   it; unblocked only by a host change.
+- **Declaration tokens saved by `codemode` exposure.** The 2.0.0 default was decided qualitatively
+  (a rarely needed sidecar should not ride in every request); the per-turn token cost of the
+  `direct` declaration — description, prompt section and the four-action schema — was never counted
+  against a real tokenizer. Free and offline to measure, and only worth it before anyone proposes
+  flipping a default back.
+- **Union members exported from the package root.** `ProviderChatModelConfig`,
+  `ProviderImageModelConfig` and `ProviderClassifierModelConfig` are declared and exported inside
+  `dist/core/extensions/types.d.ts`, but only the union `ProviderModelConfig` is re-exported from
+  `dist/index.d.ts` and no specifier reaches the internal module — so this repo names its own
+  `ChatModelConfig` / `ImageModelConfig` with `Extract`. Measured 2026-10-03 on two 1.0.0 installs,
+  re-verified unchanged on 1.1.0: `docs/notes/2026-10-11-host-model-config-export-surface.md`. An
+  upstream ask, not a task here; if the root ever re-exports the members (or pi-ai grows a
+  config-union narrowing helper next to `assertChatModel`), each alias collapses into one import.
 
 ## Cache work from the 2026-10-07 long-session research
 

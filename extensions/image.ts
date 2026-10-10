@@ -22,9 +22,11 @@ import path from "node:path";
 import type { ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 // The host does not re-export the union members (`ProviderImageModelConfig`
-// and friends) from the package root — measured on two pi 1.0.0 installs — so
-// the image member is named locally through the exported union, exactly like
-// the chat member in alibaba.ts.
+// and friends) from the package root — measured on two pi 1.0.0 installs and
+// re-verified on 1.1.0, evidence in
+// docs/notes/2026-10-11-host-model-config-export-surface.md — so the image
+// member is named locally through the exported union, exactly like the chat
+// member in alibaba.ts.
 export type ImageModelConfig = Extract<ProviderModelConfig, { type: "image" }>;
 
 // The implementation contract is reached through the exported ProviderConfig
