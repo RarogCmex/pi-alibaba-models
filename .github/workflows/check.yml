@@ -1,0 +1,248 @@
+---
+# Зачем это нужно. `peerDependencies` здесь намеренно `*` — так велят доки pi
+# (`docs/packages.md`: host-provided пакеты объявляются с диапазоном `"*"`),
+# поэтому новый pi молча загрузит расширение, и дрейф хоста возможен без единого
+# коммита здесь. Это не гипотеза: 2026-09-30 pi 0.87.1 → 0.99.1 изменил то, как
+# тело ошибки доезжает до адаптера, и три теста pi-fuelix покраснели.
+#
+# Отличие этой репы от восьми остальных в семействе (у них `check.yml` байт в
+# байт один и тот же, devDependencies пусты, а pi линкуется из глобальной
+# установки): хост здесь — настоящая `devDependencies` (`pi-coding-agent ^1.1.0`,
+# TypeScript 6.0.3, `package-lock.json` закоммичен), как в pi-volcengine и
+# pi-paratera. Поэтому две job'ы:
+#   pinned — `npm ci`, то есть ровно поддерживаемая конфигурация;
+#   latest — то же, но pi заменён на свежий: это и есть детектор дрейфа.
+#
+# `schedule:` здесь НЕТ, и это измерено, а не забыто. Репозиторий — форк
+# Fornace/pi-alibaba-models (`gh api repos/RarogCmex/pi-alibaba-models --jq .fork`
+# → true, 2026-10-11), а в форках автоматические события выключены, пока их не
+# включат записью: в pi-meta 2026-10-03 GET того же эндпоинта отвечал
+# `enabled: true`, прогонов всё равно не было, и gate снял только PUT
+# (`gh api -X PUT repos/<owner>/<repo>/actions/permissions -F enabled=true
+# -F allowed_actions=all -F sha_pinned=false`); push-прогон появился в ту же
+# минуту. Cron при этом в форке не оживает вообще — в pi-meta три слота `*/5`
+# дали 0 прогонов после включения флагов. Здесь та же картина на 2026-10-11:
+# у десяти не-форков семейства по 7 прогонов, включая 1 scheduled, у этого
+# форка — 0. Значит еженедельного safety-net'а нет, и блок cron в файле
+# читался бы следующим человеком как существующий gate. Детектор дрейфа поэтому
+# срабатывает на каждый push в main и вручную (`workflow_dispatch`).
+#
+# Прогоняется только офлайн-набор: `tests/` не трогает сеть (фикстуры,
+# `globalThis.fetch` подменяется, домены нерутабельные), а живые пробы —
+# генерация изображений и кэш-прогрев — тратят реальные деньги ключа.
+#
+# Job `tag` — про то, почему теги ставит CI. Вручную был поставлен ровно один
+# (`v2.0.1`, 2026-10-06): у 2.1.0, 2.1.1 и 2.1.2 релизные коммиты есть, тегов
+# нет. Тег создаётся только после зелёной `pinned` (не `latest`: дрейф на свежем
+# хосте — отдельный сигнал, релиз проверен на поддерживаемом), только в main и
+# только когда `v<version>` ещё не существует. Целится он не в HEAD, а в коммит,
+# который ввёл эту версию в `package.json`, — иначе документационный коммит
+# после релиза украл бы тег.
+name: check
+
+"on":
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pinned:
+    name: pinned host (npm ci)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 — нижняя граница `engines` у pi (>=22.19), 26 — то, на чём
+        # расширение разрабатывается (локально 273/273 и чистый tsc 6.0.3).
+        node: ["22", "26"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Show what is being tested
+        run: |
+          node --version
+          npm ls --depth=0 @earendil-works/pi-coding-agent @earendil-works/pi-ai typescript
+
+      - name: Typecheck and test
+        run: npm run check
+
+  latest:
+    name: latest host (drift catcher)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "26"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Point the repo at the latest published host (one matched copy)
+        # Почему не `npm install …@latest` поверх дерева. Первый вариант этого
+        # шага в pi-volcengine делал именно так и давал красный typecheck при
+        # полностью зелёных тестах: npm оставлял в дереве **две** копии pi-ai
+        # (нашу поверх + вложенную зависимость pi), и TypeScript сравнивал два
+        # номинально разных набора типов — `Provider<GatewayApi>` не
+        # присваивался `Provider<Api>` (TS2345, прогон 2026-09-30). Поэтому хост
+        # ставится в отдельный префикс и линкуется одной согласованной парой.
+        #
+        # Если шаг красный — сначала смотрим на guard и версии ниже, и только
+        # потом подозреваем код: тесты идут следующим шагом.
+        run: |
+          set -euo pipefail
+          HOST=/tmp/pi-host
+          rm -rf "$HOST"; mkdir -p "$HOST"; cd "$HOST"
+          npm init --yes >/dev/null
+          npm install @earendil-works/pi-coding-agent@latest >/dev/null
+          cd "$GITHUB_WORKSPACE"
+
+          PI="$HOST/node_modules/@earendil-works/pi-coding-agent"
+          PIAI="$PI/node_modules/@earendil-works/pi-ai"
+          [ -d "$PIAI" ] || PIAI="$HOST/node_modules/@earendil-works/pi-ai"
+          [ -d "$PIAI" ] || { echo "::error::pi-ai not found next to the freshly installed pi"; exit 1; }
+
+          rm -rf node_modules/@earendil-works/pi-ai node_modules/@earendil-works/pi-coding-agent
+          ln -s "$PI" node_modules/@earendil-works/pi-coding-agent
+          ln -s "$PIAI" node_modules/@earendil-works/pi-ai
+
+          # guard: pi-ai в дереве обязана быть ТОЙ ЖЕ копией, что несёт сам pi.
+          # Иначе typecheck сравнивает два набора типов и врёт про несовместимость.
+          TOP_REAL=$(node -e 'console.log(require("fs").realpathSync("node_modules/@earendil-works/pi-ai"))')
+          HOST_REAL=$(node -e 'console.log(require("fs").realpathSync(process.argv[1]))' "$PIAI")
+          if [ "$TOP_REAL" != "$HOST_REAL" ]; then
+            echo "::error::pi-ai in the tree ($TOP_REAL) is not the copy pi bundles ($HOST_REAL)"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const ver = (p) => JSON.parse(fs.readFileSync(p + "/package.json", "utf8")).version;
+            console.log("host under test: pi-coding-agent " + ver("node_modules/@earendil-works/pi-coding-agent")
+              + " + pi-ai " + ver("node_modules/@earendil-works/pi-ai") + " (one copy)");
+          '
+
+      - name: Typecheck and test against the latest host
+        run: npm run check
+
+  tag:
+    name: tag the release commit
+    needs: pinned
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Единственная job'а с правом записи: создаёт тег. Дефолт репозитория —
+      # `read` (измерено: actions/permissions/workflow), поэтому повышение
+      # объявлено здесь явно и только здесь.
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Полная история нужна pickaxe'у ниже: искать коммит, который ввёл
+          # эту версию, по одному shallow-срезу нельзя.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Find the release commit for the current version
+        id: target
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          if gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq .object.sha >/dev/null 2>&1; then
+            printf '::notice::%s уже существует — тег не ставим\n' "$tag"
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Коммит, который ВВЁЛ эту версию. Pickaxe по строке версии даёт обоих
+          # кандидатов — тот, что добавил, и тот, что позже её убрал, — поэтому
+          # перебираем от нового к старому и берём первый, у которого версия в
+          # `package.json` совпадает. Для текущей версии это всегда коммит
+          # релиза; для уже заменённой — иначе тег уехал бы на следующий релиз.
+          sha=""
+          while read -r candidate; do
+            [ -n "$candidate" ] || continue
+            at="$(git show "${candidate}:package.json" \
+              | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")"
+            if [ "$at" = "$version" ]; then sha="$candidate"; break; fi
+          done < <(git log --format=%H -S"\"version\": \"${version}\"" -- package.json)
+          if [ -z "$sha" ]; then
+            echo "::error::ни один коммит в истории не объявляет версию ${version}"
+            exit 1
+          fi
+          at_sha="$(git show "${sha}:package.json" \
+            | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")"
+          if [ "$at_sha" != "$version" ]; then
+            echo "::error::${sha} несёт версию ${at_sha}, а не ${version}"
+            exit 1
+          fi
+          printf '::notice::%s → %s\n' "$tag" "$sha"
+          echo 'needed=true' >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the annotated tag
+        if: steps.target.outputs.needed == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Аннотированный, как единственный существующий `v2.0.1`
+          # (`git cat-file -t v2.0.1` → tag): объект с tagger'ом и сообщением.
+          # Создаётся через API, а не `git push origin <tag>`, — не нужен
+          # настроенный remote с правами записи и нет гонки с параллельным
+          # прогоном: второй POST в git/refs вернёт 422, а не перетрёт тег.
+          object="$(gh api -X POST "repos/${GH_REPO}/git/tags" \
+            -f tag="$TAG" -f message="$TAG" -f object="$SHA" -f type=commit \
+            --jq .sha)"
+          gh api -X POST "repos/${GH_REPO}/git/refs" \
+            -f ref="refs/tags/${TAG}" -f sha="$object" >/dev/null
+          printf '::notice::тег %s создан на %s\n' "$TAG" "$SHA"

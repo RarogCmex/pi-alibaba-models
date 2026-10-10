@@ -35,8 +35,10 @@
     "vision"
   ],
   "scripts": {
-    "build": "tsc",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "npm run typecheck",
     "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "check": "npm run typecheck && npm test",
     "prepublishOnly": "npm run build"
   },
   "files": [
