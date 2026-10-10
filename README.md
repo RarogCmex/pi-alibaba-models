@@ -176,14 +176,22 @@ the two engines never refresh the same block.
 | Telemetry | on | One JSON line per turn and per warm in `alibaba-cache.jsonl` |
 
 The same page has **Warm now** (send a refresh immediately and print what the provider reported) and
-**Cache statistics** (hit rate, cached vs cold tokens, and how many warms arrived after expiry —
-rewrites mean the interval is too long for your prompt size). `/alibaba → Status` shows the engine
-state, the next refresh, and the current model's cache economics.
+**Cache statistics** (hit rate, cached vs cold tokens, and how the refreshes ended: hits, rewrites
+that arrived after expiry, **blind** replays, failures). Rewrites mean the interval is too long for
+your prompt size; blind means the provider answered and reported neither a hit nor a creation, so
+nothing says the block was renewed. `/alibaba → Status` shows the engine state, the next refresh,
+and the current model's cache economics.
 
 Failures back off (×2, ×3, ×4 on the interval) and end the run after four, because a warm that cannot
-get through is usually a rate limit and the next real request needs that quota. A warm never overlaps
+get through is usually a rate limit and the next real request needs that quota. **Three blind
+replays in a row end it too** — a context whose refreshes renew nothing is paying a full prefill
+every interval for nothing (measured: 27 replays of a 376 453-token `deepseek-v4.1-flash` context
+over 1 h 37 m, `cached_tokens` 0–4 096, 22–50 s each, and no real request ever came back for the
+block — [`docs/notes/2026-10-11-cache-warm-blind-probes.md`](docs/notes/2026-10-11-cache-warm-blind-probes.md)).
+Any real request clears the streak. A warm never overlaps
 a real request, and compaction or a branch switch drops the captured request instead of warming a
-prefix that no longer exists.
+prefix that no longer exists. Records carry a `ctx` id (a hash of the cached prefix head) so a miss
+can be attributed to one context when several run in parallel.
 
 ### What a cached turn costs
 

@@ -36,6 +36,7 @@ import {
 import {
   appendCacheLog,
   cacheFieldsFromStreamEvent,
+  contextId,
   createCacheWarmer,
   DASHSCOPE_CACHE_TTL_SECONDS,
   declaredCacheTtlSeconds,
@@ -104,6 +105,20 @@ const resolveOwnPackageDir = (): string | null => {
   }
 };
 const CONFIG_PATH = path.join(HOME_DIR, "alibaba-config.json");
+// This copy's own version, read from the manifest so a message cannot go stale:
+// the host-floor error below hardcoded it and still said 2.1.1 when the package
+// had shipped 2.1.2.
+const SELF_VERSION = ((): string => {
+  try {
+    const root = resolveOwnPackageDir();
+    if (!root) return "pi-alibaba-models";
+    const v = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"))?.version;
+    return typeof v === "string" && v ? `pi-alibaba-models ${v}` : "pi-alibaba-models";
+  } catch {
+    return "pi-alibaba-models";
+  }
+})();
+
 const AUTH_PATH = path.join(HOME_DIR, "auth.json");
 // Private, versioned catalog snapshot (the "plan C" hybrid): it fills provider
 // registration at boot with zero network and keeps the extension independent
@@ -2312,7 +2327,9 @@ function cacheStatusLines(cfg: AlibabaConfig, warmer: CacheWarmer, logPath: stri
       ? ` — next warm in ${Math.max(0, Math.round(((st.nextWarmAt ?? Date.now()) - Date.now()) / 1000))}s`
       : ` — idle (${st.reason ?? "no request captured yet"})`
     : "";
-  const counters = st.warms ? `; ${st.warms} warms: ${st.hits} hits, ${st.rewrites} late, ${st.failures} failed` : "";
+  const counters = st.warms
+    ? `; ${st.warms} warms: ${st.hits} hits, ${st.rewrites} late, ${st.blind} blind, ${st.failures} failed`
+    : "";
   const currency = cfg.costCurrency === "usd" ? "usd" : "cny";
   const unit = currency === "usd"
     ? `USD/M (÷${cfg.cnyPerUsd || DEFAULT_CNY_PER_USD})`
@@ -2408,7 +2425,7 @@ async function cacheWarmMenu(ctx: ExtensionCommandContext, warmer: CacheWarmer, 
       : `idle (${st.reason ?? "no request captured yet"})`;
     const choice = await ctx.ui.select(
       `Cache warming — ${s.mode}, refresh ${s.refreshSeconds}s, horizon ${s.horizonMinutes}m, ≥${s.minPromptTokens.toLocaleString("en-US")} tokens\n` +
-      `Engine: ${state}; ${st.warms} warms (${st.hits} hits, ${st.rewrites} rewrites, ${st.failures} failed)`,
+      `Engine: ${state}; ${st.warms} warms (${st.hits} hits, ${st.rewrites} rewrites, ${st.blind} blind, ${st.failures} failed)`,
       [
         "Engine…",
         "Refresh interval…",
@@ -2480,8 +2497,13 @@ async function cacheWarmMenu(ctx: ExtensionCommandContext, warmer: CacheWarmer, 
           `Turns:  ${sum.turns} — ${sum.turnHits} hit / ${sum.turnMisses} cold` +
             (sum.hitRatePct === null ? "" : ` (${sum.hitRatePct}%)`),
           `Tokens: ${sum.cachedTokens.toLocaleString("en-US")} cached, ${sum.missedTokens.toLocaleString("en-US")} re-read at full price`,
-          `Warms:  ${sum.warms} — ${sum.warmHits} hits, ${sum.warmRewrites} arrived after expiry, ${sum.warmFailures} failed`,
+          `Warms:  ${sum.warms} — ${sum.warmHits} hits, ${sum.warmRewrites} arrived after expiry, ` +
+            `${sum.warmBlind} blind, ${sum.warmFailures} failed`,
           sum.warmRewrites ? "Rewrites mean the refresh interval is too long for this prompt size." : "",
+          sum.warmBlind
+            ? "Blind replays reported neither a hit nor a creation — the block was not renewed. " +
+              "Three in a row end the run; a model that keeps doing it is not warmable this way."
+            : "",
         ].filter(Boolean).join("\n"),
         "info",
       );
@@ -2513,7 +2535,7 @@ export default async function (pi: ExtensionAPI) {
   // registering a half-working provider.
   if (!hostVersionSupported(VERSION)) {
     throw new Error(
-      `pi-alibaba-models 2.1.1 requires pi 1.0.0 or newer (found ${VERSION}). ` +
+      `${SELF_VERSION} requires pi 1.0.0 or newer (found ${VERSION}). ` +
       `Stay on pi-alibaba-models 1.5.3 for older hosts.`,
     );
   }
@@ -2533,6 +2555,11 @@ export default async function (pi: ExtensionAPI) {
   // (DashScope reports them only in `usage.x_details[].prompt_tokens_details`),
   // so the raw event is the only place they exist.
   const cacheFieldsByModel = new Map<string, CacheUsage>();
+  // Prefix head of the request in flight, per model, so a turn record can say
+  // which context it belongs to: one process can serve several (a child agent,
+  // a sidecar call), and without the id a miss cannot be attributed to any of
+  // them — which is what made the 2026-10-11 warm investigation guesswork.
+  const warmCtxByModel = new Map<string, string>();
   pi.on("provider_stream_event", (event) => {
     if (event.provider !== "alibaba-plan" && event.provider !== "alibaba-cloud") return;
     const cls = classifyStreamError(event.data);
@@ -2589,10 +2616,12 @@ export default async function (pi: ExtensionAPI) {
     // payload event and the next real request overwrites them first. pi's own
     // warmer skips summaries the same way, by routing id.
     if (headers) {
+      const warmCtx = contextId(outgoing, model.api);
       if (!modelCachesPrompt(model.id)) {
         // Warming a model with no cache rows would buy nothing and spend quota.
         warmer.invalidate(`${model.id} has no prompt caching`);
       } else {
+        if (warmCtx) warmCtxByModel.set(`${model.provider}/${model.id}`, warmCtx);
         warmer.noteRequest({
           provider: model.provider,
           model: model.id,
@@ -2601,6 +2630,7 @@ export default async function (pi: ExtensionAPI) {
           headers,
           payload: outgoing,
           at: Date.now(),
+          ctx: warmCtx,
         });
         warmer.noteInFlight(true);
       }
@@ -2615,11 +2645,13 @@ export default async function (pi: ExtensionAPI) {
     const key = `${m.provider}/${m.model}`;
     const raw = cacheFieldsByModel.get(key);
     cacheFieldsByModel.delete(key);
+    const warmCtx = warmCtxByModel.get(key);
+    warmCtxByModel.delete(key);
     // A handler that throws would surface on the turn it was only measuring,
     // so every field is read defensively.
     const usage = m.usage ?? { input: 0, cacheRead: 0, cacheWrite: 0 };
     const promptTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-    warmer.notePromptTokens(promptTokens);
+    warmer.notePromptTokens(promptTokens, warmCtx);
     if (!warmSettings().telemetry) return;
     appendCacheLog(CACHE_LOG_PATH, {
       ts: m.timestamp || Date.now(),
@@ -2627,6 +2659,7 @@ export default async function (pi: ExtensionAPI) {
       provider: m.provider,
       model: m.model,
       api: ctx.model?.api ?? "",
+      ctx: warmCtx,
       promptTokens,
       cached: raw?.cached ?? usage.cacheRead ?? 0,
       creation: raw?.creation ?? usage.cacheWrite ?? 0,

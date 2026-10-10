@@ -132,6 +132,23 @@ monthly token volume.
 - **Warm rewrites.** A nonzero `arrived after expiry` count in `/alibaba → Cloud — Cache Warming →
   Cache statistics` means the refresh interval is too long for that prompt size. If it shows up on
   500k+ prompts, scale the interval with the prompt estimate instead of using one constant.
+- **Blind replays.** Since 2.1.3 three replays that report neither a hit ≥ 5 % of the prompt nor a
+  creation end the run for that context; `/alibaba → Cache statistics` counts them separately. What
+  is *not* known is why a context goes blind: `deepseek-v4.1-flash` did at 149 794 and 376 453
+  tokens (27 probes, 1 h 37 m, no real request waiting) while `glm-5.3` renewed 31 of 31 at
+  265 259 and the same deepseek model renewed at 6 350 in a live probe — both implicit-cache models,
+  so cache mode and size are risk factors, not verdicts
+  (`docs/notes/2026-10-11-cache-warm-blind-probes.md` §7). The data that would decide it: the `ctx`
+  field now on every record, plus one size sweep (same context replayed at 50k / 150k / 300k) on a
+  model that went blind. If blind streaks turn out to correlate with size, the floor belongs in
+  `resolveContextWindow`-style per-model data rather than in a streak counter.
+- **Per-context warm slots.** One warmer per pi process keeps exactly one captured request, so a
+  process that serves two Cloud contexts (parent + child agent, or a sidecar call on the same
+  provider) refreshes whichever spoke last and lets the other expire. `notePromptTokens(n, ctx)`
+  already refuses a size from a foreign context, which removes the worst of it (a 4k child turn
+  could stop a 150k context's warming). Whether the rest is worth per-context slots is now
+  measurable instead of guessable: group `alibaba-cache.jsonl` by `ctx` and look for two ids alive
+  in one process's time window with interleaved turns.
 - **Implicit-TTL survival curve** (note §6.6): one fixed prefix, header `disable`, re-sent after
   6/10/20/40/60 min. Decides whether P2-K is worth reopening.
 - **Quota-aware interval.** `/alibaba → Rate limits (Cloud)` already reads `usage_limit` per model;

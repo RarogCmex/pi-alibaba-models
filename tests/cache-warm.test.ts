@@ -5,12 +5,16 @@ import os from "node:os";
 import path from "node:path";
 import {
   appendCacheLog,
+  BLIND_HIT_FRACTION,
   buildWarmPayload,
   cacheFieldsFromStreamEvent,
+  contextId,
   createCacheWarmer,
   DASHSCOPE_CACHE_TTL_SECONDS,
   declaredCacheTtlSeconds,
   DEFAULT_WARM_SETTINGS,
+  isBlindWarm,
+  MAX_BLIND_WARMS,
   parseCacheUsage,
   planWarm,
   readCacheLog,
@@ -66,6 +70,21 @@ const ANTHROPIC_USAGE = {
   cache_read_input_tokens: 44_000,
   cache_creation_input_tokens: 0,
 };
+// deepseek-v4.1-flash, 2026-10-09T18:12:39Z onward: 27 replays of a 376 453-token
+// context, each reporting the first block only and no creation tokens, each a
+// 22–50 s cold prefill, and no real request ever came back for the block.
+// Verbatim shape from ~/.pi/agent/alibaba-cache.jsonl.
+const DEEPSEEK_BLIND_TINY_HIT = {
+  input_tokens: 376_453,
+  input_tokens_details: { cached_tokens: 1_024 },
+  output_tokens: 16,
+  x_details: [{ prompt_tokens_details: { cached_tokens: 1_024 }, x_billing_type: "response_api" }],
+};
+const DEEPSEEK_BLIND_ZERO = {
+  ...DEEPSEEK_BLIND_TINY_HIT,
+  input_tokens_details: { cached_tokens: 0 },
+  x_details: [{ prompt_tokens_details: { cached_tokens: 0 }, x_billing_type: "response_api" }],
+};
 
 describe("resolveWarmSettings", () => {
   it("defaults to warming, at 216 s, for 4 h, above 20k tokens", () => {
@@ -107,7 +126,7 @@ describe("declaredCacheTtlSeconds", () => {
 describe("planWarm", () => {
   const settings: WarmSettings = { ...DEFAULT_WARM_SETTINGS, minPromptTokens: 20_000 };
   const T0 = 1_800_000_000_000;
-  const base: WarmState = { lastRequestAt: T0, promptTokens: 150_000, inFlight: false, failures: 0 };
+  const base: WarmState = { lastRequestAt: T0, promptTokens: 150_000, inFlight: false, failures: 0, blind: 0 };
 
   it("waits until the refresh is due, measured from the last renewal", () => {
     assert.deepEqual(planWarm(base, settings, T0 + 10_000), { action: "wait", delayMs: 206_000 });
@@ -146,6 +165,92 @@ describe("planWarm", () => {
     assert.deepEqual(planWarm({ ...base, failures: 1 }, settings, T0 + 432_000), { action: "warm" });
     assert.deepEqual(planWarm({ ...base, failures: 3 }, settings, T0 + 216_000 * 3), { action: "wait", delayMs: 216_000 });
     assert.equal(planWarm({ ...base, failures: 4 }, settings, T0 + 999_000).action, "stop");
+  });
+
+  it("gives up on replays that renewed nothing, one short of the failure rule", () => {
+    assert.equal(planWarm({ ...base, blind: MAX_BLIND_WARMS - 1 }, settings, T0 + 216_000).action, "warm");
+    assert.deepEqual(planWarm({ ...base, blind: MAX_BLIND_WARMS }, settings, T0 + 216_000), {
+      action: "stop", reason: `${MAX_BLIND_WARMS} warm replays renewed nothing`,
+    });
+    // Blindness is not a failure: no backoff, and the two rules stay independent.
+    assert.deepEqual(planWarm({ ...base, blind: 2 }, settings, T0 + 216_000), { action: "warm" });
+  });
+});
+
+describe("isBlindWarm", () => {
+  it("counts a replay as blind only when nothing says the block is alive", () => {
+    // No hit, no creation: nothing to show for a full prefill.
+    assert.equal(isBlindWarm(0, 0, 376_453), true);
+    assert.equal(isBlindWarm(undefined, undefined, 376_453), true);
+    // The measured deepseek case: one or four blocks of a 376 453-token prefix.
+    assert.equal(isBlindWarm(1_024, 0, 376_453), true);
+    assert.equal(isBlindWarm(4_096, 0, 376_453), true);
+    assert.equal(4_096 / 376_453 < BLIND_HIT_FRACTION, true);
+    // A real hit, and a rewrite (creation reported), are both evidence.
+    assert.equal(isBlindWarm(149_000, 0, 150_000), false);
+    assert.equal(isBlindWarm(0, 149_000, 150_000), false);
+    assert.equal(isBlindWarm(1_024, 375_000, 376_453), false);
+    // A context that grew since the last renewal still counts as renewed.
+    assert.equal(isBlindWarm(90_000, 0, 150_000), false);
+    // At the fraction boundary, and with no prompt size to judge against, the
+    // probe gets the benefit of the doubt.
+    assert.equal(isBlindWarm(Math.round(150_000 * BLIND_HIT_FRACTION), 0, 150_000), false);
+    assert.equal(isBlindWarm(Math.round(150_000 * BLIND_HIT_FRACTION) - 1, 0, 150_000), true);
+    assert.equal(isBlindWarm(1_024, 0, 0), false);
+  });
+});
+
+describe("contextId", () => {
+  const responses = (over: Record<string, unknown> = {}) => ({
+    model: "qwen3.8-max-0902",
+    instructions: "You are pi. cwd: /Users/u/repo",
+    input: [
+      { role: "user", content: "read the report" },
+      { role: "assistant", content: "reading it now" },
+    ],
+    tools: [{ name: "bash" }, { name: "read" }],
+    ...over,
+  });
+
+  it("is one id for one conversation, however long the tail grows", () => {
+    const head = contextId(responses(), "openai-responses");
+    assert.match(head ?? "", /^[0-9a-f]{8}$/);
+    const grown = responses({
+      input: [
+        ...responses().input as unknown[],
+        ...Array.from({ length: 400 }, (_, i) => ({ role: "user", content: `turn ${i} ${"x".repeat(5_000)}` })),
+      ],
+    });
+    assert.equal(contextId(grown, "openai-responses"), head);
+  });
+
+  it("separates what a provider cache separates", () => {
+    const base = contextId(responses(), "openai-responses");
+    assert.notEqual(contextId(responses({ instructions: "You are pi. cwd: /other" }), "openai-responses"), base);
+    assert.notEqual(contextId(responses({ input: [{ role: "user", content: "something else" }] }), "openai-responses"), base);
+    assert.notEqual(contextId(responses({ tools: [{ name: "bash" }] }), "openai-responses"), base);
+  });
+
+  it("reads the Completions shape as well", () => {
+    const completions = {
+      model: "deepseek-v4.1-flash",
+      messages: [
+        { role: "system", content: "You are pi." },
+        { role: "user", content: "hi" },
+      ],
+    };
+    const id = contextId(completions, "openai-completions");
+    assert.match(id ?? "", /^[0-9a-f]{8}$/);
+    assert.equal(contextId({ ...completions, messages: [...completions.messages, { role: "assistant", content: "hello" }] }, "openai-completions"), id);
+    // The same words on the Responses shape are a different request, not the
+    // same id: `instructions` is where its system prompt lives.
+    assert.notEqual(contextId(completions, "openai-responses"), id);
+  });
+
+  it("is undefined when there is no head to hash", () => {
+    assert.equal(contextId(undefined, "openai-responses"), undefined);
+    assert.equal(contextId("payload", "openai-responses"), undefined);
+    assert.equal(contextId({ model: "qwen3.8-max-0902" }, "openai-responses"), undefined);
   });
 });
 
@@ -308,18 +413,24 @@ describe("cache telemetry log", () => {
       rec({ kind: "warm", cached: 149_000, creation: 0 }),
       rec({ kind: "warm", cached: 0, creation: 149_000 }),
       rec({ kind: "warm", ok: false, cached: 0, note: "HTTP 429" }),
+      // Blind: answered, and neither a hit worth the name nor a creation.
+      rec({ kind: "warm", cached: 0, creation: 0, note: "no renewal reported" }),
+      rec({ kind: "warm", cached: 1_024, creation: 0, promptTokens: 376_453 }),
     ]);
     assert.deepEqual(
       { turns: s.turns, turnHits: s.turnHits, turnMisses: s.turnMisses, hitRatePct: s.hitRatePct },
       { turns: 2, turnHits: 1, turnMisses: 1, hitRatePct: 50 },
     );
     assert.deepEqual(
-      { warms: s.warms, warmHits: s.warmHits, warmRewrites: s.warmRewrites, warmFailures: s.warmFailures },
-      { warms: 3, warmHits: 1, warmRewrites: 1, warmFailures: 1 },
+      { warms: s.warms, warmHits: s.warmHits, warmRewrites: s.warmRewrites, warmBlind: s.warmBlind, warmFailures: s.warmFailures },
+      { warms: 5, warmHits: 1, warmRewrites: 1, warmBlind: 2, warmFailures: 1 },
     );
     assert.equal(s.cachedTokens, 149_000);
     assert.equal(s.missedTokens, 120_000);
+    // Only real hits count as cached: a blind probe saved nothing.
+    assert.equal(s.warmCachedTokens, 149_000);
     assert.equal(summarizeCacheLog([]).hitRatePct, null);
+    assert.equal(summarizeCacheLog([]).warmBlind, 0);
   });
 
   it("trims the file back to its tail once it grows past the cap", () => {
@@ -367,12 +478,20 @@ function harness(opts: { settings?: Partial<WarmSettings>; status?: number; usag
       } as unknown as Response;
     },
   });
+  const payload = {
+    model: "qwen3.8-max-0902",
+    instructions: "You are pi. cwd: /repo",
+    input: [{ role: "user", content: "hi" }],
+    stream: true,
+    max_output_tokens: 8192,
+  };
   const template = {
     provider: "alibaba-cloud", model: "qwen3.8-max-0902", api: "openai-responses",
     baseUrl: "https://ws.example/compatible-mode/v1",
     headers: { authorization: "Bearer k", "x-dashscope-session-cache": "enable" },
-    payload: { model: "qwen3.8-max-0902", input: [{ role: "user", content: "hi" }], stream: true, max_output_tokens: 8192 },
+    payload,
     at: clock,
+    ctx: contextId(payload, "openai-responses") as string,
   };
   /** Run every timer that came due, flushing the async warm between them. */
   const advance = async (ms: number) => {
@@ -527,5 +646,85 @@ describe("cache warmer engine", () => {
     await h.advance(216_000);
     assert.equal(h.requests.length, 1);
     assert.deepEqual(readCacheLog(h.logFile), []);
+  });
+
+  it("stops replaying a context that renews nothing, and starts again on a real request", async () => {
+    const h = harness({ usage: DEEPSEEK_BLIND_ZERO });
+    h.warmer.noteRequest(h.template);
+    h.warmer.notePromptTokens(376_453, h.template.ctx);
+    for (let i = 1; i <= MAX_BLIND_WARMS; i++) {
+      await h.advance(216_000);
+      assert.equal(h.requests.length, i, `probe ${i} should have gone out`);
+      assert.equal(h.warmer.status().blind, i);
+    }
+    const st = h.warmer.status();
+    assert.match(st.reason ?? "", /renewed nothing/);
+    assert.equal(st.running, false);
+    assert.equal(st.hits, 0);
+    assert.equal(st.failures, 0, "a blind probe is not a failure: the provider answered 200");
+    // 1 h 37 m of probes is what this replaced; nothing more goes out.
+    await h.advance(216_000 * 27);
+    assert.equal(h.requests.length, MAX_BLIND_WARMS);
+    assert.equal(h.timers.length, 0);
+
+    // A real request renews the block itself, so the streak is history.
+    h.warmer.noteRequest({ ...h.template, at: h.at() });
+    h.warmer.notePromptTokens(376_453, h.template.ctx);
+    assert.equal(h.warmer.status().blind, 0);
+    await h.advance(216_000);
+    assert.equal(h.requests.length, MAX_BLIND_WARMS + 1);
+
+    // Every blind probe says so in the log, with the context it belongs to.
+    const logged = readCacheLog(h.logFile);
+    assert.equal(logged.length, MAX_BLIND_WARMS + 1);
+    assert.equal(logged[0].note, "no renewal reported");
+    assert.equal(logged[0].ctx, h.template.ctx);
+    assert.equal(logged[0].promptTokens, 376_453);
+    assert.equal(summarizeCacheLog(logged).warmBlind, MAX_BLIND_WARMS + 1);
+  });
+
+  it("counts a first-block-only hit as blind, which is what deepseek reported", async () => {
+    const h = harness({ usage: DEEPSEEK_BLIND_TINY_HIT });
+    h.warmer.noteRequest(h.template);
+    h.warmer.notePromptTokens(376_453, h.template.ctx);
+    await h.advance(216_000);
+    const st = h.warmer.status();
+    assert.equal(st.blind, 1);
+    assert.equal(st.hits, 0, "1 024 of 376 453 tokens is not a hit");
+    assert.equal(readCacheLog(h.logFile)[0].note, "no renewal reported");
+  });
+
+  it("keeps the warmed context's size when another context reports a smaller one", async () => {
+    const h = harness();
+    h.warmer.noteRequest(h.template);
+    h.warmer.notePromptTokens(150_000, h.template.ctx);
+    // A child agent or a sidecar call in the same process: 4 096 tokens says
+    // nothing about the 150k block being kept alive, and used to drop the
+    // estimate under the floor and stop the run.
+    h.warmer.notePromptTokens(4_096, "00000000");
+    assert.equal(h.warmer.status().promptTokens, 150_000);
+    await h.advance(216_000);
+    assert.equal(h.requests.length, 1);
+
+    // From the warmed context itself the number does apply — the already armed
+    // timer still fires once, then the floor stops the run.
+    h.warmer.notePromptTokens(4_096, h.template.ctx);
+    assert.equal(h.warmer.status().promptTokens, 4_096);
+    await h.advance(216_000);
+    assert.equal(h.requests.length, 2);
+    await h.advance(216_000 * 3);
+    assert.equal(h.requests.length, 2);
+    assert.match(h.warmer.status().reason ?? "", /under 20,000 tokens/);
+  });
+
+  it("records the context on a warm it did send", async () => {
+    const h = harness();
+    h.warmer.noteRequest(h.template);
+    h.warmer.notePromptTokens(150_000, h.template.ctx);
+    await h.advance(216_000);
+    const logged = readCacheLog(h.logFile);
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0].ctx, h.template.ctx);
+    assert.equal(h.warmer.status().template?.ctx, h.template.ctx);
   });
 });

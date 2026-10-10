@@ -16,11 +16,23 @@
 // which pi cannot see because DashScope puts creation tokens in
 // `usage.x_details[].prompt_tokens_details` only.
 //
+// What the provider reports is also the only evidence that a replay did
+// anything, and for some models it reports nothing: on 2026-10-09 a
+// deepseek-v4.1-flash context of 376 453 tokens was replayed 27 times over
+// 1 h 37 m — every probe `cached_tokens: 0`, every probe a 22–50 s cold prefill,
+// and no real request ever came back to use the block (docs/notes/
+// 2026-10-11-cache-warm-blind-probes.md). `MAX_BLIND_WARMS` ends that: a replay
+// that reports neither a hit worth the name nor a creation is blind, and three
+// blind replays in a row stop the run until the next real request. qwen3.8-max
+// and glm-5.3 never produce one (0 of 1 124 successful probes), so the guard is
+// measured to be silent exactly where warming works.
+//
 // pi's own warmer is switched off for Cloud models while this engine runs, by
 // not declaring `promptCache` (the only field pi's warmer reads). Mode `pi`
 // hands warming back: the declaration returns and `warmingDecisionOverride`
 // replaces pi's dollar gate with the same latency rule.
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -32,6 +44,16 @@ export const WARM_MAX_OUTPUT_TOKENS = 16;
 const WARM_TIMEOUT_MS = 180_000;
 /** Consecutive failures after which warming stops until the next real request. */
 const MAX_WARM_FAILURES = 4;
+/** Consecutive blind replays after which warming stops: they renew nothing. */
+export const MAX_BLIND_WARMS = 3;
+/**
+ * Below this share of the prompt a reported "hit" is only the first block or
+ * two, with everything after it re-prefilled — blind in every way that matters.
+ * The band is empty in four days of telemetry: the head-only deepseek-v4.1-flash
+ * probes reported 0–1.09 % of the prompt, while every one of the 1 112 real hits
+ * on qwen3.8-max-0902 and glm-5.3 was ≥ 99.98 % (2026-10-11).
+ */
+export const BLIND_HIT_FRACTION = 0.05;
 /** Re-check delay while a provider request is in flight. */
 const INFLIGHT_RETRY_MS = 2_000;
 
@@ -102,6 +124,21 @@ export function declaredCacheTtlSeconds(refreshSeconds: number): number {
 
 // ── Scheduling (pure) ───────────────────────────────────────────────────
 
+/**
+ * A replay that proves nothing: the provider reported neither a hit worth the
+ * name nor a creation, so nothing says the block is alive for the next turn.
+ */
+export function isBlindWarm(
+  cached: number | undefined,
+  creation: number | undefined,
+  promptTokens: number,
+): boolean {
+  if ((creation ?? 0) > 0) return false;
+  const hit = cached ?? 0;
+  if (hit <= 0) return true;
+  return promptTokens > 0 && hit / promptTokens < BLIND_HIT_FRACTION;
+}
+
 export interface WarmState {
   /** When the last real provider request was dispatched (the block's birthday). */
   lastRequestAt: number;
@@ -113,6 +150,8 @@ export interface WarmState {
   inFlight: boolean;
   /** Consecutive warm failures, for backoff. */
   failures: number;
+  /** Consecutive replays that reported no renewal. */
+  blind: number;
 }
 
 export type WarmPlan =
@@ -130,6 +169,11 @@ export type WarmPlan =
 export function planWarm(state: WarmState, settings: WarmSettings, now: number): WarmPlan {
   if (state.inFlight) return { action: "wait", delayMs: INFLIGHT_RETRY_MS };
   if (state.failures >= MAX_WARM_FAILURES) return { action: "stop", reason: `${MAX_WARM_FAILURES} warm requests failed in a row` };
+  // Not a failure — the provider answered 200 — but nothing came of it, and a
+  // cold prefill of a 376k prompt every 216 s is quota the next real turn needs.
+  if (state.blind >= MAX_BLIND_WARMS) {
+    return { action: "stop", reason: `${MAX_BLIND_WARMS} warm replays renewed nothing` };
+  }
   if (state.promptTokens <= 0) return { action: "stop", reason: "no prompt-size estimate yet" };
   if (state.promptTokens < settings.minPromptTokens) {
     return { action: "stop", reason: `prompt under ${settings.minPromptTokens.toLocaleString("en-US")} tokens` };
@@ -287,6 +331,27 @@ export function cacheFieldsFromStreamEvent(api: string, data: unknown): CacheUsa
 const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 
+/**
+ * Identity of the cached prefix: the head of the request, which is what the
+ * provider's cache keys on. Two turns of one conversation share it; a child
+ * agent, a sidecar call or a second session does not. Telemetry only — so it
+ * stays cheap on a 500k-token payload by slicing every field it looks at
+ * instead of hashing the whole thing.
+ */
+export function contextId(payload: unknown, api: string): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const head: string[] = [];
+  const push = (v: unknown) => head.push(JSON.stringify(v ?? null).slice(0, 2_000));
+  // The system prompt is the start of the cached prefix on all three shapes,
+  // and `tools` are part of it for cache purposes (a tool-list change is a miss).
+  push(api === "openai-responses" ? payload.instructions : payload.system);
+  const msgs = api === "openai-responses" ? payload.input : payload.messages;
+  if (Array.isArray(msgs)) for (const m of msgs.slice(0, 2)) push(m);
+  if (Array.isArray(payload.tools)) push(payload.tools.map((t) => (isRecord(t) ? t.name : t)));
+  if (head.every((h) => h === "null")) return undefined;
+  return crypto.createHash("sha1").update(head.join("\u0000")).digest("hex").slice(0, 8);
+}
+
 // ── Telemetry log ───────────────────────────────────────────────────────
 
 export interface CacheLogRecord {
@@ -299,6 +364,8 @@ export interface CacheLogRecord {
   cached: number;
   creation: number;
   cacheType?: string;
+  /** Prefix head this record belongs to (see `contextId`), when it could be derived. */
+  ctx?: string;
   ms?: number;
   ok: boolean;
   note?: string;
@@ -351,6 +418,8 @@ export interface CacheSummary {
   warms: number;
   warmHits: number;
   warmRewrites: number;
+  /** Replays that reported no renewal: paid for, and nothing to show for it. */
+  warmBlind: number;
   warmFailures: number;
   warmCachedTokens: number;
   first?: number;
@@ -362,7 +431,7 @@ export function summarizeCacheLog(records: CacheLogRecord[]): CacheSummary {
   const s: CacheSummary = {
     turns: 0, turnHits: 0, turnMisses: 0, hitRatePct: null,
     cachedTokens: 0, missedTokens: 0,
-    warms: 0, warmHits: 0, warmRewrites: 0, warmFailures: 0, warmCachedTokens: 0,
+    warms: 0, warmHits: 0, warmRewrites: 0, warmBlind: 0, warmFailures: 0, warmCachedTokens: 0,
   };
   for (const r of records) {
     if (r.ts !== undefined) {
@@ -371,7 +440,11 @@ export function summarizeCacheLog(records: CacheLogRecord[]): CacheSummary {
     }
     if (r.kind === "warm") {
       s.warms++;
+      // A rewrite is only known when the provider reports creation tokens;
+      // counting every hit-less probe as one hid the blind deepseek replays
+      // behind a word that claims they did something.
       if (!r.ok) s.warmFailures++;
+      else if (isBlindWarm(r.cached, r.creation, r.promptTokens)) s.warmBlind++;
       else if (r.cached > 0) { s.warmHits++; s.warmCachedTokens += r.cached; }
       else s.warmRewrites++;
       continue;
@@ -395,6 +468,8 @@ export interface WarmTemplate {
   headers: Record<string, string>;
   payload: unknown;
   at: number;
+  /** Prefix head this request belongs to (see `contextId`), for telemetry. */
+  ctx?: string;
 }
 
 export interface WarmResult {
@@ -413,11 +488,13 @@ export interface WarmStatus {
   nextWarmAt?: number;
   lastWarmAt?: number;
   lastResult?: WarmResult;
-  template?: { model: string; api: string; at: number };
+  template?: { model: string; api: string; at: number; ctx?: string };
   promptTokens: number;
   warms: number;
   hits: number;
   rewrites: number;
+  /** Replays that reported no renewal, since the last real request. */
+  blind: number;
   failures: number;
 }
 
@@ -434,7 +511,14 @@ export interface CacheWarmerDeps {
 
 export interface CacheWarmer {
   noteRequest(t: WarmTemplate): void;
-  notePromptTokens(n: number): void;
+  /**
+   * Prompt size of a completed response. `ctx` is the prefix head it belongs to:
+   * a size from a *different* context — a child agent or a sidecar call in the
+   * same process — says nothing about the block being warmed, and accepting it
+   * can push the estimate under `minPromptTokens` and stop the run for the
+   * context that matters.
+   */
+  notePromptTokens(n: number, ctx?: string): void;
   noteInFlight(v: boolean): void;
   /** Transcript changed shape (compaction, branch switch, new session). */
   invalidate(reason: string): void;
@@ -464,6 +548,7 @@ export function createCacheWarmer(deps: CacheWarmerDeps): CacheWarmer {
   let inFlight = false;
   let promptTokens = 0;
   let failures = 0;
+  let blind = 0;
   let lastWarmAt: number | undefined;
   let lastResult: WarmResult | undefined;
   let warms = 0;
@@ -472,7 +557,7 @@ export function createCacheWarmer(deps: CacheWarmerDeps): CacheWarmer {
   let warming = false;
 
   const state = (lastRequestAt: number): WarmState => ({
-    lastRequestAt, lastWarmAt, promptTokens, inFlight, failures,
+    lastRequestAt, lastWarmAt, promptTokens, inFlight, failures, blind,
   });
 
   const clear = () => {
@@ -532,23 +617,32 @@ export function createCacheWarmer(deps: CacheWarmerDeps): CacheWarmer {
     warms++;
     lastWarmAt = started;
     lastResult = result;
-    if (result.ok) {
+    const blindProbe = result.ok
+      && isBlindWarm(result.usage?.cached, result.usage?.creation, result.usage?.input ?? promptTokens);
+    if (!result.ok) {
+      failures++;
+    } else if (blindProbe) {
+      // Answered, and nothing to show for it: no hit worth the name, no creation.
       failures = 0;
+      blind++;
+    } else {
+      failures = 0;
+      blind = 0;
       if ((result.usage?.cached ?? 0) > 0) hits++;
       else if (result.rewrote) rewrites++;
-    } else {
-      failures++;
     }
     deps.log?.(`[alibaba] cache warm ${t.model}: ${result.ok
-      ? `${(result.usage?.cached ?? 0).toLocaleString("en-US")} cached, ${(result.usage?.creation ?? 0).toLocaleString("en-US")} created in ${Math.round(result.ms)}ms`
+      ? `${(result.usage?.cached ?? 0).toLocaleString("en-US")} cached, ${(result.usage?.creation ?? 0).toLocaleString("en-US")} created in ${Math.round(result.ms)}ms${blindProbe ? " (no renewal)" : ""}`
       : `failed (${result.error})`}`);
     if (settings.telemetry) {
       appendCacheLog(deps.logFile(), {
-        ts: started, kind: "warm", provider: t.provider, model: t.model, api: t.api,
+        ts: started, kind: "warm", provider: t.provider, model: t.model, api: t.api, ctx: t.ctx,
         promptTokens: result.usage?.input ?? promptTokens,
         cached: result.usage?.cached ?? 0, creation: result.usage?.creation ?? 0,
         cacheType: result.usage?.cacheType, ms: Math.round(result.ms), ok: result.ok,
-        note: result.ok ? (result.rewrote ? "rewrote expired block" : undefined) : result.error,
+        note: result.ok
+          ? blindProbe ? "no renewal reported" : result.rewrote ? "rewrote expired block" : undefined
+          : result.error,
       });
     }
     // The warm renewed the block (or re-created it), so the next one is a full
@@ -560,10 +654,12 @@ export function createCacheWarmer(deps: CacheWarmerDeps): CacheWarmer {
     noteRequest(t) {
       template = t;
       failures = 0;
+      blind = 0;
       stopped = "";
       arm();
     },
-    notePromptTokens(n) {
+    notePromptTokens(n, ctx) {
+      if (template?.ctx && ctx && ctx !== template.ctx) return;
       promptTokens = Number.isFinite(n) && n > 0 ? n : promptTokens;
       if (template && !timer && !warming) arm();
     },
@@ -589,9 +685,9 @@ export function createCacheWarmer(deps: CacheWarmerDeps): CacheWarmer {
         nextWarmAt: timer === undefined ? undefined : nextWarmAt,
         lastWarmAt,
         lastResult,
-        template: template ? { model: template.model, api: template.api, at: template.at } : undefined,
+        template: template ? { model: template.model, api: template.api, at: template.at, ctx: template.ctx } : undefined,
         promptTokens,
-        warms, hits, rewrites, failures,
+        warms, hits, rewrites, blind, failures,
       };
     },
     async warmNow() {
