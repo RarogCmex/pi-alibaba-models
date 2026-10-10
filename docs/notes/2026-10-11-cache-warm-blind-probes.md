@@ -103,28 +103,50 @@ to 3.
 
 ## 6. Live probes, 2026-10-11: neither the replay shape nor the size is the problem
 
-Same payload sent four times per model — one streaming (the shape of a real turn), then three
-warm-shaped (`stream: false`, `max_output_tokens: 16`) at 330 s / 216 s / 216 s, unique nonce per
-model so nothing could ride an earlier block:
+Script and raw output are committed:
+[`2026-10-11-cache-warm-renewal-probe.mjs`](2026-10-11-cache-warm-renewal-probe.mjs) →
+[`2026-10-11-cache-warm-renewal-results.jsonl`](2026-10-11-cache-warm-renewal-results.jsonl)
+(21 records). It reads the key and the bound workspace domain from
+`~/.pi/agent/{auth,alibaba-config}.json` and prints neither.
+
+**Shape phase** (`--size shape`, ≈ 3.7k tokens, no waiting): does each wire shape report cache
+counters at all?
+
+| Model | S1 create (non-streaming) | S2 warm shape (non-streaming) | S3 streaming |
+|---|---|---|---|
+| deepseek-v4.1-flash | 200, cached 0 | 200, cached 3 584 (96.5 %) | 200, cached 3 584 |
+| glm-5.3 | 200, cached 0 | 200, cached 3 584 (97.0 %) | 200, cached 3 584 |
+| qwen3.8-max-0902 | 200, cached 0 | 200, cached 3 072 (81.9 %) | 200, cached 3 072 |
+
+So `usage.input_tokens_details.cached_tokens` is present on the warm shape for all three — the
+parser was never blind. Note what is *absent*: `x_details[0].prompt_tokens_details.cache_creation_input_tokens`
+was `null` on every one of these nine calls, including the three cold creates, while the production
+log has 12 qwen probes that did report creation. Creation reporting is therefore not reliable on
+this workspace, which is exactly why "blind" (neither a hit nor a creation) is the honest label and
+why `summarizeCacheLog()` must not read a missing creation as a rewrite.
+
+**Renewal phases** (`--size small|big`): one streaming request, then three warm replays at +330 s
+(past the documented 300 s TTL), +216 s and +216 s — the engine's own interval. Unique nonce per
+phase, so nothing rides an earlier block.
 
 | Model | Prompt tokens | A (stream) | B (+330 s) | C (+216 s) | D (+216 s) |
 |---|---|---|---|---|---|
-| deepseek-v4.1-flash | 6 350 | 200, 2.1 s | `incomplete`, cached 6 144, 2.5 s | cached 6 144, 2.5 s | cached 6 144, 2.3 s |
-| deepseek-v4.1-flash | **356 560** | 200, 12.2 s | `completed`, cached 356 352, 11.8 s | cached 356 352, 11.6 s | cached 356 352, 12.6 s |
-| qwen3.8-max-0902 | 7 378 | 200, 2.7 s | `incomplete`, cached 7 168, 2.8 s | cached 7 168, 3.4 s | cached 7 168, 3.4 s |
+| deepseek-v4.1-flash | 6 350 | 200, 2.1 s | `incomplete`, cached 6 144 (96.8 %), 2.5 s | cached 6 144, 2.5 s | cached 6 144, 2.3 s |
+| deepseek-v4.1-flash | **356 560** | 200, 12.2 s | `completed`, cached 356 352 (99.94 %), 11.8 s | cached 356 352, 11.6 s | cached 356 352, 12.6 s |
+| qwen3.8-max-0902 | 7 378 | 200, 2.7 s | `incomplete`, cached 7 168 (97.2 %), 2.8 s | cached 7 168, 3.4 s | cached 7 168, 3.4 s |
 
-Three things follow, all of them against the obvious explanations:
+(The streaming legs of the 2026-10-11 run predate the committed script's SSE parsing, so they
+record HTTP status and elapsed time only; the `shape` phase covers the streaming usage fields.)
 
-- **The parser was never blind.** Every warm-shaped response carries
-  `usage.input_tokens_details.cached_tokens`, and `x_details[0].prompt_tokens_details` was there
-  too (without `cache_creation_input_tokens`, which is why a re-creation is unreportable).
+Three things follow, all against the obvious explanations:
+
 - **The 16-token cap is harmless.** It makes reasoning models answer `status: "incomplete"`
   (sometimes `completed`), and the block is cached and renewed anyway — D hit 13.6 min after the
   only real request.
+- **A warm replay renews.** C and D hit at both sizes, so B and C each left a live block behind.
 - **Size is not the trigger.** The 356 560-token deepseek context — within 5 % of the 376 453 that
-  went blind in production, on the same model, same endpoint, same replay shape — renewed twice,
-  at 11.6–12.6 s per probe. The blind probes of 2026-10-09 took 22–50 s each: those were cold
-  prefills, these are hits.
+  went blind in production, same model, endpoint and replay shape — renewed twice at 11.6–12.6 s
+  per probe. The blind probes of 2026-10-09 took 22–50 s each: those were cold prefills.
 
 ## 7. Open: what made that one context unwarmable
 
@@ -163,6 +185,10 @@ let the next real request — which does re-create the block — start a fresh r
 ## 9. Reproducing
 
 ```bash
+# The provider probes behind §6 (shape ≈ 1 min, each renewal phase ≈ 14 min per model):
+node docs/notes/2026-10-11-cache-warm-renewal-probe.mjs --size shape
+node docs/notes/2026-10-11-cache-warm-renewal-probe.mjs --size big --out /tmp/big.jsonl
+
 # Per-model roll-up, blind probes, streaks:
 node -e 'const fs=require("fs");const L=fs.readFileSync(process.env.HOME+"/.pi/agent/alibaba-cache.jsonl","utf8").trim().split("\n").map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean);
 const blind=e=>e.kind==="warm"&&e.ok&&!(e.creation>0)&&(!e.cached||e.cached/e.promptTokens<0.05);
